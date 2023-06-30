@@ -57,6 +57,7 @@
 #include "utils/rel.h"
 #include "utils/resowner_private.h"
 #include "utils/timestamp.h"
+#include "replication/walsender.h"
 
 
 /* Note: these two macros only work on shared buffers, not local ones! */
@@ -159,6 +160,10 @@ int			maintenance_io_concurrency = DEFAULT_MAINTENANCE_IO_CONCURRENCY;
 int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+
+/* Evict unpinned pages (for better test coverage) */
+bool		zenith_test_evict = false;
+
 
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
@@ -798,7 +803,8 @@ ReadBufferWithoutRelcache(RelFileLocator rlocator, ForkNumber forkNum,
 {
 	bool		hit;
 
-	SMgrRelation smgr = smgropen(rlocator, InvalidBackendId);
+	SMgrRelation smgr = smgropen(rlocator, InvalidBackendId,
+								 RELPERSISTENCE_PERMANENT);
 
 	return ReadBuffer_common(smgr, permanent ? RELPERSISTENCE_PERMANENT :
 							 RELPERSISTENCE_UNLOGGED, forkNum, blockNum,
@@ -998,8 +1004,11 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	bool		found;
 	IOContext	io_context;
 	IOObject	io_object;
-	bool		isLocalBuf = SmgrIsTemp(smgr);
-
+	/*
+	 * wal_redo postgres is working in single user mode, we do not need to synchronize access to shared buffer,
+	 * so let's use local buffers instead
+	 */
+	bool		isLocalBuf = SmgrIsTemp(smgr) || am_wal_redo_postgres;
 	*hit = false;
 
 	/*
@@ -1994,10 +2003,15 @@ ExtendBufferedRelShared(ExtendBufferedWhat eb,
 			buf_block = BufHdrGetBlock(existing_hdr);
 
 			if (valid && !PageIsNew((Page) buf_block))
-				ereport(ERROR,
+			{
+				// XXX-ZENITH
+				// FIXME here was a merge conflict and code around has changed. Is it still relevant?
+				MemSet((char *) buf_block, 0, BLCKSZ);
+				ereport(DEBUG1,
 						(errmsg("unexpected data beyond EOF in block %u of relation %s",
 								existing_hdr->tag.blockNum, relpath(eb.smgr->smgr_rlocator, fork)),
 						 errhint("This has been seen to occur with buggy kernels; consider updating your system.")));
+			}
 
 			/*
 			 * We *must* do smgr[zero]extend before succeeding, else the page
@@ -2455,6 +2469,32 @@ UnpinBuffer(BufferDesc *buf)
 				UnlockBufHdr(buf, buf_state);
 		}
 		ForgetPrivateRefCountEntry(ref);
+
+		if (zenith_test_evict && !InRecovery)
+		{
+			buf_state = LockBufHdr(buf);
+			if (BUF_STATE_GET_REFCOUNT(buf_state) == 0)
+			{
+				if (buf_state & BM_DIRTY)
+				{
+					ReservePrivateRefCountEntry();
+					PinBuffer_Locked(buf);
+					if (LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf),
+												 LW_SHARED))
+					{
+						FlushOneBuffer(b);
+						LWLockRelease(BufferDescriptorGetContentLock(buf));
+					}
+					UnpinBuffer(buf);
+				}
+				else
+				{
+					InvalidateBuffer(buf);
+				}
+			}
+			else
+				UnlockBufHdr(buf, buf_state);
+		}
 	}
 }
 
@@ -3373,7 +3413,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Find smgr relation for buffer */
 	if (reln == NULL)
-		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId);
+		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId, 0);
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
 										buf->tag.blockNum,
@@ -4277,7 +4317,9 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	use_wal = XLogIsNeeded() && (permanent || forkNum == INIT_FORKNUM);
 
 	/* Get number of blocks in the source relation. */
-	nblocks = smgrnblocks(smgropen(srclocator, InvalidBackendId),
+	nblocks = smgrnblocks(smgropen(srclocator, InvalidBackendId,
+						  permanent ? RELPERSISTENCE_PERMANENT
+						  :RELPERSISTENCE_UNLOGGED),
 						  forkNum);
 
 	/* Nothing to copy; just return. */
@@ -4289,7 +4331,8 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	 * relation before starting to copy block by block.
 	 */
 	memset(buf.data, 0, BLCKSZ);
-	smgrextend(smgropen(dstlocator, InvalidBackendId), forkNum, nblocks - 1,
+	smgrextend(smgropen(dstlocator, InvalidBackendId, permanent ? RELPERSISTENCE_PERMANENT
+						  :RELPERSISTENCE_UNLOGGED), forkNum, nblocks - 1,
 			   buf.data, true);
 
 	/* This is a bulk operation, so use buffer access strategies. */
@@ -4371,9 +4414,9 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
-		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum))
+		if (smgrexists(smgropen(src_rlocator, InvalidBackendId, relpersistence), forkNum))
 		{
-			smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
+			smgrcreate(smgropen(dst_rlocator, InvalidBackendId, relpersistence), forkNum, false);
 
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
@@ -5562,8 +5605,8 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		i += ahead;
 
 		/* and finally tell the kernel to write the data to storage */
-		reln = smgropen(currlocator, InvalidBackendId);
-		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
+		reln = smgropen(currlocator, InvalidBackendId, 0);
+		smgrwriteback(reln,  BufTagGetForkNum(&tag), tag.blockNum, nblocks);
 	}
 
 	/*

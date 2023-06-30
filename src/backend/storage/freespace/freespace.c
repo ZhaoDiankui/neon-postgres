@@ -617,6 +617,20 @@ fsm_extend(Relation rel, BlockNumber fsm_nblocks)
 							   EB_CLEAR_SIZE_CACHE,
 							   fsm_nblocks,
 							   RBM_ZERO_ON_ERROR);
+
+//FIXME Here was a merge conflict. Move this code somewhere to a proper place.
+// 		/*
+// 		 * ZENITH: Initialize FSM pages through buffer cache to prevent loading
+// 		 * them from pageserver.
+// 		 */
+// 		Buffer	buffer = ReadBufferExtended(rel, FSM_FORKNUM, P_NEW, RBM_ZERO_AND_LOCK, NULL);
+// 		Page	page = BufferGetPage(buffer);
+
+// 		PageInit((Page) page, BLCKSZ, 0);
+// 		PageSetChecksumInplace(page, fsm_nblocks_now);
+// 		MarkBufferDirty(buffer);
+// 		UnlockReleaseBuffer(buffer);
+// 
 }
 
 /*

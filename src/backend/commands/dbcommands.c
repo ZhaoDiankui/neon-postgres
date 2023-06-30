@@ -276,7 +276,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 	rlocator.dbOid = dbid;
 	rlocator.relNumber = relfilenumber;
 
-	smgr = smgropen(rlocator, InvalidBackendId);
+	smgr = smgropen(rlocator, InvalidBackendId, RELPERSISTENCE_PERMANENT);
 	nblocks = smgrnblocks(smgr, MAIN_FORKNUM);
 	smgrclose(smgr);
 
@@ -467,8 +467,8 @@ CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid, bool isRedo)
 	 * Note that we don't have to copy this from the source database; there's
 	 * only one legal value.
 	 */
-	sprintf(buf, "%s\n", PG_MAJORVERSION);
-	nbytes = strlen(PG_MAJORVERSION) + 1;
+	sprintf(buf, "%s", PG_MAJORVERSION);
+	nbytes = strlen(PG_MAJORVERSION);
 
 	/* If we are not in WAL replay then write the WAL. */
 	if (!isRedo)
@@ -486,6 +486,8 @@ CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid, bool isRedo)
 						 sizeof(xl_dbase_create_wal_log_rec));
 
 		lsn = XLogInsert(RM_DBASE_ID, XLOG_DBASE_CREATE_WAL_LOG);
+
+		SetLastWrittenLSNForDatabase(lsn);
 
 		/* As always, WAL must hit the disk before the data update does. */
 		XLogFlush(lsn);
@@ -614,6 +616,7 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 		/* Record the filesystem change in XLOG */
 		{
 			xl_dbase_create_file_copy_rec xlrec;
+			XLogRecPtr lsn;
 
 			xlrec.db_id = dst_dboid;
 			xlrec.tablespace_id = dsttablespace;
@@ -624,8 +627,10 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 			XLogRegisterData((char *) &xlrec,
 							 sizeof(xl_dbase_create_file_copy_rec));
 
-			(void) XLogInsert(RM_DBASE_ID,
+			lsn = XLogInsert(RM_DBASE_ID,
 							  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+
+			SetLastWrittenLSNForDatabase(lsn);
 		}
 		pfree(srcpath);
 		pfree(dstpath);
@@ -2076,6 +2081,7 @@ movedb(const char *dbname, const char *tblspcname)
 		 */
 		{
 			xl_dbase_create_file_copy_rec xlrec;
+			XLogRecPtr lsn;
 
 			xlrec.db_id = db_id;
 			xlrec.tablespace_id = dst_tblspcoid;
@@ -2086,8 +2092,10 @@ movedb(const char *dbname, const char *tblspcname)
 			XLogRegisterData((char *) &xlrec,
 							 sizeof(xl_dbase_create_file_copy_rec));
 
-			(void) XLogInsert(RM_DBASE_ID,
+			lsn = XLogInsert(RM_DBASE_ID,
 							  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+			// TODO: Do we really need to set the LSN here?
+			SetLastWrittenLSNForDatabase(lsn);
 		}
 
 		/*
@@ -3183,6 +3191,15 @@ dbase_redo(XLogReaderState *record)
 		 */
 		copydir(src_path, dst_path, false);
 
+		/*
+		 * Make sure any future requests to the page server see the new
+		 * database.
+		 */
+		{
+			XLogRecPtr	lsn = record->EndRecPtr;
+			SetLastWrittenLSNForDatabase(lsn);
+		}
+
 		pfree(src_path);
 		pfree(dst_path);
 	}
@@ -3204,6 +3221,14 @@ dbase_redo(XLogReaderState *record)
 		CreateDirAndVersionFile(dbpath, xlrec->db_id, xlrec->tablespace_id,
 								true);
 		pfree(dbpath);
+		/*
+		 * Make sure any future requests to the page server see the new
+		 * database.
+		 */
+		{
+			XLogRecPtr	lsn = record->EndRecPtr;
+			SetLastWrittenLSNForDatabase(lsn);
+		}
 	}
 	else if (info == XLOG_DBASE_DROP)
 	{

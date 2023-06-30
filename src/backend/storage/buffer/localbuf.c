@@ -19,12 +19,15 @@
 #include "catalog/catalog.h"
 #include "executor/instrument.h"
 #include "pgstat.h"
+#include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 #include "utils/resowner_private.h"
 
+/* ZENITH: prevent eviction of the buffer of target page */
+extern Buffer wal_redo_buffer;
 
 /*#define LBDEBUG*/
 
@@ -198,6 +201,12 @@ GetLocalVictimBuffer(void)
 
 		if (LocalRefCount[victim_bufid] == 0)
 		{
+			if (-victim_bufid - 1 == wal_redo_buffer)
+			{
+				/* ZENITH: Prevent eviction of the buffer with target wal redo page */
+				continue;
+			}
+
 			buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 			if (BUF_STATE_GET_USAGECOUNT(buf_state) > 0)
@@ -219,6 +228,38 @@ GetLocalVictimBuffer(void)
 					 errmsg("no empty local buffer available")));
 	}
 
+	//FIXME Here was a merge conflict.
+	/*
+	 * this buffer is not referenced but it might still be dirty. if that's
+	 * the case, write it out before reusing it!
+	 */
+	if (buf_state & BM_DIRTY)
+	{
+		SMgrRelation oreln;
+		Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
+
+		/* Find smgr relation for buffer */
+		if (am_wal_redo_postgres && MyBackendId == InvalidBackendId)
+			oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId, RELPERSISTENCE_PERMANENT);
+		else
+			oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId, RELPERSISTENCE_TEMP);
+
+		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
+
+		/* And write... */
+		smgrwrite(oreln,
+				  bufHdr->tag.forkNum,
+				  bufHdr->tag.blockNum,
+				  localpage,
+				  false);
+
+		/* Mark not-dirty now in case we error out below */
+		buf_state &= ~BM_DIRTY;
+		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
+
+		pgBufferUsage.local_blks_written++;
+	}
+
 	/*
 	 * lazy memory allocation: allocate space on first use of a buffer.
 	 */
@@ -238,9 +279,12 @@ GetLocalVictimBuffer(void)
 		SMgrRelation oreln;
 		Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
+		//FIXME What is correst RELPERSISTENCE here?
 		/* Find smgr relation for buffer */
-		oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId);
-
+		if (am_wal_redo_postgres && MyBackendId == InvalidBackendId)
+			oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId, RELPERSISTENCE_PERMANENT);
+		else
+			oreln = smgropen(BufTagGetRelFileLocator(&bufHdr->tag), MyBackendId, RELPERSISTENCE_TEMP);
 		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 		io_start = pgstat_prepare_io_time();

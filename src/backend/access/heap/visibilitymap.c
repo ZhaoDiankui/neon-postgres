@@ -299,7 +299,9 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				 * WAL record inserted above, so it would be incorrect to
 				 * update the heap page's LSN.
 				 */
+				/* NEON: we have to update page LSN even if  wal_log_hints=off 
 				if (XLogHintBitIsNeeded())
+				*/
 				{
 					Page		heapPage = BufferGetPage(heapBuf);
 
@@ -634,6 +636,19 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 							  vm_nblocks,
 							  RBM_ZERO_ON_ERROR);
 
+// FIXME Resolve this merge conflict
+// /*
+// 		 * ZENITH: Initialize VM pages through buffer cache to prevent loading
+// 		 * them from pageserver.
+// 		 */
+// 		Buffer	buffer = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, P_NEW,
+// 											RBM_ZERO_AND_LOCK, NULL);
+// 		Page	page = BufferGetPage(buffer);
+
+// 		PageInit((Page) page, BLCKSZ, 0);
+// 		PageSetChecksumInplace(page, vm_nblocks_now);
+// 		MarkBufferDirty(buffer);
+// 		UnlockReleaseBuffer(buffer);
 	/*
 	 * Send a shared-inval message to force other backends to close any smgr
 	 * references they may have for this rel, which we are about to change.

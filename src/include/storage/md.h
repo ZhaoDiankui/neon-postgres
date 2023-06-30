@@ -32,6 +32,7 @@ extern void mdzeroextend(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks, bool skipFsync);
 extern bool mdprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum);
+extern void md_reset_prefetch(SMgrRelation reln);
 extern void mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				   void *buffer);
 extern void mdwrite(SMgrRelation reln, ForkNumber forknum,
