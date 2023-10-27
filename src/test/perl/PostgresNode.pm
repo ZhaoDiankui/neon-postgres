@@ -92,9 +92,9 @@ use Carp;
 use Config;
 use Cwd;
 use Exporter 'import';
-use Fcntl qw(:mode);
+use Fcntl qw(:mode :flock :seek :DEFAULT);
 use File::Basename;
-use File::Path qw(rmtree);
+use File::Path qw(rmtree mkpath);
 use File::Spec;
 use File::stat qw(stat);
 use File::Temp ();
@@ -113,7 +113,10 @@ our @EXPORT = qw(
 );
 
 our ($use_tcp, $test_localhost, $test_pghost, $last_host_assigned,
-	$last_port_assigned, @all_nodes, $died);
+	$last_port_assigned, @all_nodes, $died, $portdir);
+
+# list of file reservations made by get_free_port
+my @port_reservation_files;
 
 INIT
 {
@@ -129,6 +132,20 @@ INIT
 
 	# Tracking of last port value assigned to accelerate free port lookup.
 	$last_port_assigned = int(rand() * 16384) + 49152;
+
+	# Set the port lock directory
+
+	# If we're told to use a directory (e.g. from a buildfarm client)
+	# explicitly, use that
+	$portdir = $ENV{PG_TEST_PORT_DIR};
+	# Otherwise, try to use a directory at the top of the build tree
+	# or as a last resort use the tmp_check directory
+	my $build_dir = $ENV{top_builddir}
+	  || $TestLib::tmp_check ;
+	$portdir ||= "$build_dir/portlock";
+	$portdir =~ s!\\!/!g;
+	# Make sure the directory exists
+	mkpath($portdir) unless -d $portdir;
 }
 
 =pod
@@ -1409,8 +1426,8 @@ by test cases that need to start other, non-Postgres servers.
 Ports assigned to existing PostgresNode objects are automatically
 excluded, even if those servers are not currently running.
 
-XXX A port available now may become unavailable by the time we start
-the desired service.
+The port number is reserved so that other concurrent test programs will not
+try to use the same port.
 
 =cut
 
@@ -1459,6 +1476,7 @@ sub get_free_port
 					last;
 				}
 			}
+			$found = _reserve_port($port) if $found;
 		}
 	}
 
@@ -1489,6 +1507,40 @@ sub can_bind
 	return $ret;
 }
 
+# Internal routine to reserve a port number
+# Returns 1 if successful, 0 if port is already reserved.
+sub _reserve_port
+{
+	my $port = shift;
+	# open in rw mode so we don't have to reopen it and lose the lock
+	my $filename = "$portdir/$port.rsv";
+	sysopen(my $portfile, $filename, O_RDWR|O_CREAT)
+	  || die "opening port file $filename: $!";
+	# take an exclusive lock to avoid concurrent access
+	flock($portfile, LOCK_EX) || die "locking port file $filename: $!";
+	# see if someone else has or had a reservation of this port
+	my $pid = <$portfile> || "0";
+	chomp $pid;
+	if ($pid +0 > 0)
+	{
+		if (kill 0, $pid)
+		{
+			# process exists and is owned by us, so we can't reserve this port
+			flock($portfile, LOCK_UN);
+			close($portfile);
+			return 0;
+		}
+	}
+	# All good, go ahead and reserve the port
+	seek($portfile, 0, SEEK_SET);
+	# print the pid with a fixed width so we don't leave any trailing junk
+	print $portfile sprintf("%10d\n",$$);
+	flock($portfile, LOCK_UN);
+	close($portfile);
+	push(@port_reservation_files, $filename);
+	return 1;
+}
+
 # Automatically shut down any still-running nodes (in the same order the nodes
 # were created in) when the test script exits.
 END
@@ -1507,6 +1559,8 @@ END
 		# clean basedir on clean test invocation
 		$node->clean_node if $exit_code == 0 && TestLib::all_tests_passing();
 	}
+
+	unlink @port_reservation_files;
 
 	$? = $exit_code;
 }
@@ -2094,15 +2148,9 @@ If this regular expression is set, matches it with the output generated.
 
 =item log_like => [ qr/required message/ ]
 
-If given, it must be an array reference containing a list of regular
-expressions that must match against the server log, using
-C<Test::More::like()>.
-
 =item log_unlike => [ qr/prohibited message/ ]
 
-If given, it must be an array reference containing a list of regular
-expressions that must NOT match against the server log.  They will be
-passed to C<Test::More::unlike()>.
+See C<log_check(...)>.
 
 =back
 
@@ -2123,16 +2171,6 @@ sub connect_ok
 		$sql = "SELECT \$\$connected with $connstr\$\$";
 	}
 
-	my (@log_like, @log_unlike);
-	if (defined($params{log_like}))
-	{
-		@log_like = @{ $params{log_like} };
-	}
-	if (defined($params{log_unlike}))
-	{
-		@log_unlike = @{ $params{log_unlike} };
-	}
-
 	my $log_location = -s $self->logfile;
 
 	# Never prompt for a password, any callers of this routine should
@@ -2150,19 +2188,7 @@ sub connect_ok
 	{
 		like($stdout, $params{expected_stdout}, "$test_name: matches");
 	}
-	if (@log_like or @log_unlike)
-	{
-		my $log_contents = TestLib::slurp_file($self->logfile, $log_location);
-
-		while (my $regex = shift @log_like)
-		{
-			like($log_contents, $regex, "$test_name: log matches");
-		}
-		while (my $regex = shift @log_unlike)
-		{
-			unlike($log_contents, $regex, "$test_name: log does not match");
-		}
-	}
+	$self->log_check($test_name, $log_location, %params);
 }
 
 =pod
@@ -2182,7 +2208,7 @@ If this regular expression is set, matches it with the output generated.
 
 =item log_unlike => [ qr/prohibited message/ ]
 
-See C<connect_ok(...)>, above.
+See C<log_check(...)>.
 
 =back
 
@@ -2192,16 +2218,6 @@ sub connect_fails
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 	my ($self, $connstr, $test_name, %params) = @_;
-
-	my (@log_like, @log_unlike);
-	if (defined($params{log_like}))
-	{
-		@log_like = @{ $params{log_like} };
-	}
-	if (defined($params{log_unlike}))
-	{
-		@log_unlike = @{ $params{log_unlike} };
-	}
 
 	my $log_location = -s $self->logfile;
 
@@ -2220,19 +2236,7 @@ sub connect_fails
 		like($stderr, $params{expected_stderr}, "$test_name: matches");
 	}
 
-	if (@log_like or @log_unlike)
-	{
-		my $log_contents = TestLib::slurp_file($self->logfile, $log_location);
-
-		while (my $regex = shift @log_like)
-		{
-			like($log_contents, $regex, "$test_name: log matches");
-		}
-		while (my $regex = shift @log_unlike)
-		{
-			unlike($log_contents, $regex, "$test_name: log does not match");
-		}
-	}
+	$self->log_check($test_name, $log_location, %params);
 }
 
 =pod
@@ -2401,6 +2405,82 @@ sub issues_sql_like
 	my $log = TestLib::slurp_file($self->logfile, $log_location);
 	like($log, $expected_sql, "$test_name: SQL found in server log");
 	return;
+}
+
+=pod
+
+=item $node->log_check($offset, $test_name, %parameters)
+
+Check contents of server logs.
+
+=over
+
+=item $test_name
+
+Name of test for error messages.
+
+=item $offset
+
+Offset of the log file.
+
+=item log_like => [ qr/required message/ ]
+
+If given, it must be an array reference containing a list of regular
+expressions that must match against the server log, using
+C<Test::More::like()>.
+
+=item log_unlike => [ qr/prohibited message/ ]
+
+If given, it must be an array reference containing a list of regular
+expressions that must NOT match against the server log.  They will be
+passed to C<Test::More::unlike()>.
+
+=back
+
+=cut
+
+sub log_check
+{
+	my ($self, $test_name, $offset, %params) = @_;
+
+	my (@log_like, @log_unlike);
+	if (defined($params{log_like}))
+	{
+		@log_like = @{ $params{log_like} };
+	}
+	if (defined($params{log_unlike}))
+	{
+		@log_unlike = @{ $params{log_unlike} };
+	}
+
+	if (@log_like or @log_unlike)
+	{
+		my $log_contents = TestLib::slurp_file($self->logfile, $offset);
+
+		while (my $regex = shift @log_like)
+		{
+			like($log_contents, $regex, "$test_name: log matches");
+		}
+		while (my $regex = shift @log_unlike)
+		{
+			unlike($log_contents, $regex, "$test_name: log does not match");
+		}
+	}
+}
+
+=pod
+
+=item $node->log_contains(pattern, offset)
+
+Find pattern in logfile of node after offset byte.
+
+=cut
+
+sub log_contains
+{
+	my ($self, $pattern, $offset) = @_;
+
+	return TestLib::slurp_file($self->logfile, $offset) =~ m/$pattern/;
 }
 
 =pod

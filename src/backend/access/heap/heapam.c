@@ -53,6 +53,7 @@
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
@@ -316,6 +317,27 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 		scan->rs_startblock = 0;
 	}
 
+	if (enable_seqscan_prefetch)
+	{
+		/*
+		 * Do not use tablespace setting for catalog scans, as we might have
+		 * the tablespace settings in the catalogs locked already, which
+		 * might result in a deadlock.
+		 */
+		if (IsCatalogRelation(scan->rs_base.rs_rd))
+			scan->rs_prefetch_maximum = effective_io_concurrency;
+		else
+			scan->rs_prefetch_maximum =
+				get_tablespace_io_concurrency(scan->rs_base.rs_rd->rd_rel->reltablespace);
+
+		scan->rs_prefetch_target = 1;
+	}
+	else
+	{
+		scan->rs_prefetch_maximum = -1;
+		scan->rs_prefetch_target = -1;
+	}
+
 	scan->rs_numblocks = InvalidBlockNumber;
 	scan->rs_inited = false;
 	scan->rs_ctup.t_data = NULL;
@@ -397,6 +419,105 @@ heapgetpage(TableScanDesc sscan, BlockNumber page)
 	 * pages' worth of consecutive dead tuples.
 	 */
 	CHECK_FOR_INTERRUPTS();
+
+	/* Prefetch next block */
+	if (scan->rs_prefetch_maximum > 0 && scan->rs_nblocks > 1)
+	{
+		int64	nblocks;
+		int64	rel_scan_start;
+		int64	rel_scan_end; /* blockno of end of scan (mod scan->rs_nblocks) */
+		int64	scan_pageoff; /* page, but adjusted for scan position */
+
+		int64	prefetch_start; /* start block of prefetch requests this iteration */
+		int64	prefetch_end; /* end block of prefetch requests this iteration, if applicable */
+		ParallelBlockTableScanWorker pbscanwork = scan->rs_parallelworkerdata;
+		ParallelBlockTableScanDesc pbscandesc = (ParallelBlockTableScanDesc) sscan->rs_parallel;
+
+		/*
+		 * Parallel scans look like repeated sequential table scans for
+		 * prefetching; with a scan start at nalloc + ch_remaining - ch_size
+		 */
+		if (pbscanwork != NULL)
+		{
+			uint64	start_offset,
+					end_offset;
+
+			Assert(pbscandesc != NULL);
+			start_offset = pbscanwork->phsw_nallocated
+				+ pbscanwork->phsw_chunk_remaining + 1
+				- pbscanwork->phsw_chunk_size;
+			end_offset = Min(pbscanwork->phsw_nallocated + 
+							 pbscanwork->phsw_chunk_remaining + 1,
+							 pbscandesc->phs_nblocks);
+
+			rel_scan_start = (int64) (pbscandesc->phs_startblock) + start_offset;
+			rel_scan_end = (int64) (pbscandesc->phs_startblock) + end_offset;
+			nblocks = pbscandesc->phs_nblocks;
+		}
+		else
+		{
+			rel_scan_start = scan->rs_startblock;
+			rel_scan_end = scan->rs_startblock + scan->rs_nblocks;
+			nblocks = scan->rs_nblocks;
+		}
+
+		prefetch_end = rel_scan_end;
+
+		if ((uint64) page < rel_scan_start)
+			scan_pageoff = page + nblocks;
+		else
+			scan_pageoff = page;
+
+		Assert(rel_scan_start <= scan_pageoff && scan_pageoff <= rel_scan_end);
+
+		/*
+		 * If this is the first page of this seqscan, initiate prefetch of
+		 * pages page..page + n. On each subsequent call, prefetch the next
+		 * page that we haven't prefetched yet, at page + n.
+		 * If this is the last page of the prefetch, 
+		 */
+		if (rel_scan_start != page)
+		{
+			prefetch_start = scan_pageoff + (int64) scan->rs_prefetch_target - 1;
+			prefetch_end = prefetch_start + 1;
+		}
+		else
+		{
+			prefetch_start = scan_pageoff;
+			prefetch_end = rel_scan_end;
+		}
+
+		/* do not prefetch if the only page we're trying to prefetch is past the end of our scan window */
+		if (prefetch_start > rel_scan_end)
+			prefetch_end = 0;
+
+		if (prefetch_end > prefetch_start + scan->rs_prefetch_target)
+			prefetch_end = prefetch_start + scan->rs_prefetch_target;
+
+		if (prefetch_end > rel_scan_end)
+			prefetch_end = rel_scan_end;
+
+		RelationOpenSmgr(scan->rs_base.rs_rd);
+
+		while (prefetch_start < prefetch_end)
+		{
+			BlockNumber blckno = (prefetch_start % nblocks);
+			Assert(blckno < nblocks);
+			Assert(blckno < INT_MAX);
+			PrefetchBuffer(scan->rs_base.rs_rd, MAIN_FORKNUM, blckno);
+			prefetch_start += 1;
+		}
+
+		/*
+		 * Use exponential growth of readahead up to prefetch_maximum, to
+		 * make sure that a low LIMIT does not result in high IO overhead,
+		 * but operations in general are still very fast.
+		 */
+		if (scan->rs_prefetch_target < scan->rs_prefetch_maximum / 2)
+			scan->rs_prefetch_target *= 2;
+		else if (scan->rs_prefetch_target < scan->rs_prefetch_maximum)
+			scan->rs_prefetch_target = scan->rs_prefetch_maximum;
+	}
 
 	/* read page using selected strategy */
 	scan->rs_cbuf = ReadBufferExtended(scan->rs_base.rs_rd, MAIN_FORKNUM, page,
@@ -2217,6 +2338,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		xlhdr.t_infomask2 = heaptup->t_data->t_infomask2;
 		xlhdr.t_infomask = heaptup->t_data->t_infomask;
 		xlhdr.t_hoff = heaptup->t_data->t_hoff;
+		xlhdr.t_cid = HeapTupleHeaderGetRawCommandId(heaptup->t_data);
 
 		/*
 		 * note we mark xlhdr as belonging to buffer; if XLogInsert decides to
@@ -2240,7 +2362,18 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 
 	END_CRIT_SECTION();
 
-	UnlockReleaseBuffer(buffer);
+	if (options & HEAP_INSERT_SPECULATIVE)
+	{
+		/*
+		 * NEON: speculative token is not stored in WAL, so if the page is evicted
+		 * from the buffer cache, the token will be lost. To prevent that, we keep the
+		 * buffer pinned. It will be unpinned in heapam_tuple_finish/abort_speculative.
+		 */
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	}
+	else
+		UnlockReleaseBuffer(buffer);
+
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 
@@ -2535,6 +2668,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 				tuphdr->t_infomask2 = heaptup->t_data->t_infomask2;
 				tuphdr->t_infomask = heaptup->t_data->t_infomask;
+				tuphdr->t_cid =  HeapTupleHeaderGetRawCommandId(heaptup->t_data);
 				tuphdr->t_hoff = heaptup->t_data->t_hoff;
 
 				/* write bitmap [+ padding] [+ oid] + data */
@@ -3047,7 +3181,7 @@ l1:
 											  tp.t_data->t_infomask2);
 		xlrec.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
 		xlrec.xmax = new_xmax;
-
+		xlrec.t_cid = HeapTupleHeaderGetRawCommandId(tp.t_data);
 		if (old_key_tuple != NULL)
 		{
 			if (relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
@@ -3068,6 +3202,7 @@ l1:
 		{
 			xlhdr.t_infomask2 = old_key_tuple->t_data->t_infomask2;
 			xlhdr.t_infomask = old_key_tuple->t_data->t_infomask;
+			xlhdr.t_cid = HeapTupleHeaderGetRawCommandId(old_key_tuple->t_data);
 			xlhdr.t_hoff = old_key_tuple->t_data->t_hoff;
 
 			XLogRegisterData((char *) &xlhdr, SizeOfHeapHeader);
@@ -3793,6 +3928,7 @@ l2:
 												  oldtup.t_data->t_infomask2);
 			xlrec.flags =
 				cleared_all_frozen ? XLH_LOCK_ALL_FROZEN_CLEARED : 0;
+			xlrec.t_cid = HeapTupleHeaderGetRawCommandId(oldtup.t_data);
 			XLogRegisterData((char *) &xlrec, SizeOfHeapLock);
 			recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_LOCK);
 			PageSetLSN(page, recptr);
@@ -4981,6 +5117,7 @@ failed:
 		xlrec.infobits_set = compute_infobits(new_infomask,
 											  tuple->t_data->t_infomask2);
 		xlrec.flags = cleared_all_frozen ? XLH_LOCK_ALL_FROZEN_CLEARED : 0;
+		xlrec.t_cid = HeapTupleHeaderGetRawCommandId(tuple->t_data);
 		XLogRegisterData((char *) &xlrec, SizeOfHeapLock);
 
 		/* we don't decode row locks atm, so no need to log the origin */
@@ -5901,6 +6038,7 @@ heap_finish_speculative(Relation relation, ItemPointer tid)
 
 	END_CRIT_SECTION();
 
+	ReleaseBuffer(buffer); /* NEON: release buffer pinned by heap_insert */
 	UnlockReleaseBuffer(buffer);
 }
 
@@ -5973,6 +6111,16 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 		elog(ERROR, "attempted to kill a non-speculative tuple");
 	Assert(!HeapTupleHeaderIsHeapOnly(tp.t_data));
 
+    /*
+     * NEON: release buffer pinned by heap_insert
+     *
+     * This function is also used on the toast tuples of an aborted speculative
+     * insertion. For those, there is no token on the tuple, and we didn' t keep
+     * the pin. 
+      */
+	if (HeapTupleHeaderIsSpeculative(tp.t_data))
+		ReleaseBuffer(buffer);  
+
 	/*
 	 * No need to check for serializable conflicts here.  There is never a
 	 * need for a combo CID, either.  No need to extract replica identity, or
@@ -6030,6 +6178,7 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 											  tp.t_data->t_infomask2);
 		xlrec.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
 		xlrec.xmax = xid;
+		xlrec.t_cid = HeapTupleHeaderGetRawCommandId(tp.t_data);
 
 		XLogBeginInsert();
 		XLogRegisterData((char *) &xlrec, SizeOfHeapDelete);
@@ -8217,7 +8366,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	/* Prepare WAL data for the new page */
 	xlrec.new_offnum = ItemPointerGetOffsetNumber(&newtup->t_self);
 	xlrec.new_xmax = HeapTupleHeaderGetRawXmax(newtup->t_data);
-
+	xlrec.t_cid = HeapTupleHeaderGetRawCommandId(newtup->t_data);
 	bufflags = REGBUF_STANDARD;
 	if (init)
 		bufflags |= REGBUF_WILL_INIT;
@@ -8254,6 +8403,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	xlhdr.t_infomask2 = newtup->t_data->t_infomask2;
 	xlhdr.t_infomask = newtup->t_data->t_infomask;
 	xlhdr.t_hoff = newtup->t_data->t_hoff;
+	xlhdr.t_cid = HeapTupleHeaderGetRawCommandId(newtup->t_data);
 	Assert(SizeofHeapTupleHeader + prefixlen + suffixlen <= newtup->t_len);
 
 	/*
@@ -8295,6 +8445,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 		xlhdr_idx.t_infomask2 = old_key_tuple->t_data->t_infomask2;
 		xlhdr_idx.t_infomask = old_key_tuple->t_data->t_infomask;
 		xlhdr_idx.t_hoff = old_key_tuple->t_data->t_hoff;
+		xlhdr_idx.t_cid = HeapTupleHeaderGetRawCommandId(old_key_tuple->t_data);
 
 		XLogRegisterData((char *) &xlhdr_idx, SizeOfHeapHeader);
 
@@ -8705,8 +8856,16 @@ heap_xlog_visible(XLogReaderState *record)
 
 		PageSetAllVisible(page);
 
-		if (XLogHintBitIsNeeded())
-			PageSetLSN(page, lsn);
+		/*
+		 * NEON: despite to the comment above we need to update page LSN here.
+		 * See discussion at hackers: https://www.postgresql.org/message-id/flat/039076d4f6cdd871691686361f83cb8a6913a86a.camel%40j-davis.com#101ba42b004f9988e3d54fce26fb3462
+		 * For Neon this assignment is critical because otherwise last written LSN tracked at compute doesn't
+		 * match with page LSN assignee by WAL-redo and as a result, prefetched page is rejected.
+		 *
+		 * It is fixed in upstream in https://github.com/neondatabase/postgres/commit/7bf713dd2d0739fbcd4103971ed69c17ebe677ea
+		 * but until it is merged we still need to carry a patch here.
+		 */
+		PageSetLSN(page, lsn);
 
 		MarkBufferDirty(buffer);
 	}
@@ -8928,7 +9087,7 @@ heap_xlog_delete(XLogReaderState *record)
 			HeapTupleHeaderSetXmax(htup, xlrec->xmax);
 		else
 			HeapTupleHeaderSetXmin(htup, InvalidTransactionId);
-		HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
+		HeapTupleHeaderSetCmax(htup, xlrec->t_cid, false);
 
 		/* Mark the page as a candidate for pruning */
 		PageSetPrunable(page, XLogRecGetXid(record));
@@ -9029,7 +9188,7 @@ heap_xlog_insert(XLogReaderState *record)
 		htup->t_infomask = xlhdr.t_infomask;
 		htup->t_hoff = xlhdr.t_hoff;
 		HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+		HeapTupleHeaderSetCmin(htup, xlhdr.t_cid);
 		htup->t_ctid = target_tid;
 
 		if (PageAddItem(page, (Item) htup, newlen, xlrec->offnum,
@@ -9172,7 +9331,7 @@ heap_xlog_multi_insert(XLogReaderState *record)
 			htup->t_infomask = xlhdr->t_infomask;
 			htup->t_hoff = xlhdr->t_hoff;
 			HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-			HeapTupleHeaderSetCmin(htup, FirstCommandId);
+			HeapTupleHeaderSetCmin(htup, xlhdr->t_cid);
 			ItemPointerSetBlockNumber(&htup->t_ctid, blkno);
 			ItemPointerSetOffsetNumber(&htup->t_ctid, offnum);
 
@@ -9312,7 +9471,7 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 		fix_infomask_from_infobits(xlrec->old_infobits_set, &htup->t_infomask,
 								   &htup->t_infomask2);
 		HeapTupleHeaderSetXmax(htup, xlrec->old_xmax);
-		HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
+		HeapTupleHeaderSetCmax(htup, xlrec->t_cid, false);
 		/* Set forward chain link in t_ctid */
 		htup->t_ctid = newtid;
 
@@ -9445,7 +9604,7 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 		htup->t_hoff = xlhdr.t_hoff;
 
 		HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-		HeapTupleHeaderSetCmin(htup, FirstCommandId);
+		HeapTupleHeaderSetCmin(htup, xlhdr.t_cid);
 		HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
 		/* Make sure there is no forward chain link in t_ctid */
 		htup->t_ctid = newtid;
@@ -9586,7 +9745,7 @@ heap_xlog_lock(XLogReaderState *record)
 						   offnum);
 		}
 		HeapTupleHeaderSetXmax(htup, xlrec->locking_xid);
-		HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
+		HeapTupleHeaderSetCmax(htup, xlrec->t_cid, false);
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(buffer);
 	}

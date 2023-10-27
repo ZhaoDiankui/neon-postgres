@@ -17,7 +17,7 @@ dnl Read the Autoconf manual for details.
 dnl
 m4_pattern_forbid(^PGAC_)dnl to catch undefined macros
 
-AC_INIT([PostgreSQL], [14.6], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
+AC_INIT([PostgreSQL], [14.9], [pgsql-bugs@lists.postgresql.org], [], [https://www.postgresql.org/])
 
 m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.69], [], [m4_fatal([Autoconf version 2.69 is required.
 Untested combinations of 'autoconf' and PostgreSQL versions are not
@@ -915,6 +915,14 @@ AC_SUBST(with_selinux)
 AC_MSG_RESULT([$with_selinux])
 
 #
+# libseccomp
+#
+AC_MSG_CHECKING([whether to build with libseccomp support])
+PGAC_ARG_BOOL(with, libseccomp, no, [build with libseccomp support])
+AC_SUBST(with_libseccomp)
+AC_MSG_RESULT([$with_libseccomp])
+
+#
 # Systemd
 #
 AC_MSG_CHECKING([whether to build with systemd support])
@@ -1316,6 +1324,8 @@ if test "$with_ssl" = openssl ; then
   # thread-safety. In 1.1.0, it's no longer required, and CRYPTO_lock()
   # function was removed.
   AC_CHECK_FUNCS([CRYPTO_lock])
+  # Function introduced in OpenSSL 1.1.1.
+  AC_CHECK_FUNCS([X509_get_signature_info])
   AC_DEFINE([USE_OPENSSL], 1, [Define to 1 to build with OpenSSL support. (--with-ssl=openssl)])
 elif test "$with_ssl" != no ; then
   AC_MSG_ERROR([--with-ssl must specify openssl])
@@ -1424,6 +1434,7 @@ AC_CHECK_HEADERS(m4_normalize([
 	sys/epoll.h
 	sys/event.h
 	sys/ipc.h
+	sys/personality.h
 	sys/prctl.h
 	sys/procctl.h
 	sys/pstat.h
@@ -1562,6 +1573,11 @@ dnl but right now, what that would mainly accomplish is to encourage
 dnl people to try to use the avahi implementation, which does not work.
 dnl If you want to use Apple's own Bonjour code on another platform,
 dnl just add -ldns_sd to LIBS manually.
+fi
+
+if test "$with_libseccomp" = yes ; then
+  AC_CHECK_LIB(seccomp, seccomp_init, [],
+               [AC_MSG_ERROR([library 'libseccomp' is required for Seccomp BPF support])])
 fi
 
 # for contrib/uuid-ossp
@@ -1929,6 +1945,7 @@ if test "$PORTNAME" = "win32"; then
   AC_LIBOBJ(kill)
   AC_LIBOBJ(open)
   AC_LIBOBJ(system)
+  AC_LIBOBJ(win32common)
   AC_LIBOBJ(win32env)
   AC_LIBOBJ(win32error)
   AC_LIBOBJ(win32security)

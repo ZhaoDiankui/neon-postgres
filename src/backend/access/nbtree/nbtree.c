@@ -36,6 +36,7 @@
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
+#include "utils/spccache.h"
 
 
 /*
@@ -163,9 +164,9 @@ btbuildempty(Relation index)
 	 * this even when wal_level=minimal.
 	 */
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
-	smgrwrite(index->rd_smgr, INIT_FORKNUM, BTREE_METAPAGE,
+	smgrwrite(RelationGetSmgr(index), INIT_FORKNUM, BTREE_METAPAGE,
 			  (char *) metapage, true);
-	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+	log_newpage(&RelationGetSmgr(index)->smgr_rnode.node, INIT_FORKNUM,
 				BTREE_METAPAGE, metapage, true);
 
 	/*
@@ -173,7 +174,7 @@ btbuildempty(Relation index)
 	 * write did not go through shared_buffers and therefore a concurrent
 	 * checkpoint may have moved the redo pointer past our xlog record.
 	 */
-	smgrimmedsync(index->rd_smgr, INIT_FORKNUM);
+	smgrimmedsync(RelationGetSmgr(index), INIT_FORKNUM);
 }
 
 /*
@@ -366,6 +367,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 
 	so->killedItems = NULL;		/* until needed */
 	so->numKilled = 0;
+	so->prefetch_maximum = 0;   /* disable prefetch */
 
 	/*
 	 * We don't know yet whether the scan will be index-only, so we do not
@@ -907,6 +909,8 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	BTVacState	vstate;
 	BlockNumber num_pages;
 	BlockNumber scanblkno;
+	BlockNumber prefetch_blkno;
+	int			io_concurrency;
 	bool		needLock;
 
 	/*
@@ -946,6 +950,9 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vstate.maxbufsize = 0;
 	vstate.pendingpages = NULL;
 	vstate.npendingpages = 0;
+
+	io_concurrency = get_tablespace_maintenance_io_concurrency(rel->rd_rel->reltablespace);
+
 	/* Consider applying _bt_pendingfsm_finalize optimization */
 	_bt_pendingfsm_init(rel, &vstate, (callback == NULL));
 
@@ -975,6 +982,8 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	needLock = !RELATION_IS_LOCAL(rel);
 
 	scanblkno = BTREE_METAPAGE + 1;
+	prefetch_blkno = scanblkno;
+
 	for (;;)
 	{
 		/* Get the current relation length */
@@ -991,9 +1000,19 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		/* Quit if we've scanned the whole relation */
 		if (scanblkno >= num_pages)
 			break;
+
+		if (prefetch_blkno < scanblkno)
+			prefetch_blkno = scanblkno;
+		for (; prefetch_blkno < num_pages &&
+			   prefetch_blkno < scanblkno + io_concurrency; prefetch_blkno++)
+			PrefetchBuffer(rel, MAIN_FORKNUM, prefetch_blkno);
+
 		/* Iterate over pages, then loop back to recheck length */
 		for (; scanblkno < num_pages; scanblkno++)
 		{
+			if (io_concurrency > 0 && prefetch_blkno < num_pages)
+				PrefetchBuffer(rel, MAIN_FORKNUM, prefetch_blkno++);
+
 			btvacuumpage(&vstate, scanblkno);
 			if (info->report_progress)
 				pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE,
@@ -1088,8 +1107,7 @@ backtrack:
 		 * can't be half-dead because only an interrupted VACUUM process can
 		 * leave pages in that state, so we'd definitely have dealt with it
 		 * back when the page was the scanblkno page (half-dead pages are
-		 * always marked fully deleted by _bt_pagedel()).  This assumes that
-		 * there can be only one vacuum process running at a time.
+		 * always marked fully deleted by _bt_pagedel(), barring corruption).
 		 */
 		if (!opaque || !P_ISLEAF(opaque) || P_ISHALFDEAD(opaque))
 		{

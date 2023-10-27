@@ -221,6 +221,8 @@ llvm_release_context(JitContext *context)
 	}
 	list_free(llvm_context->handles);
 	llvm_context->handles = NIL;
+
+	llvm_leave_fatal_on_oom();
 }
 
 /*
@@ -816,7 +818,7 @@ llvm_session_initialize(void)
 
 	if (LLVMGetTargetFromTriple(llvm_triple, &llvm_targetref, &error) != 0)
 	{
-		elog(FATAL, "failed to query triple %s\n", error);
+		elog(FATAL, "failed to query triple %s", error);
 	}
 
 	/*

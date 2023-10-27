@@ -76,6 +76,8 @@ extern int	checkpoint_flush_after;
 extern int	backend_flush_after;
 extern int	bgwriter_flush_after;
 
+extern bool	zenith_test_evict;
+
 /* in buf_init.c */
 extern PGDLLIMPORT char *BufferBlocks;
 
@@ -84,8 +86,8 @@ extern PGDLLIMPORT int NLocBuffer;
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
 
-/* upper limit for effective_io_concurrency */
-#define MAX_IO_CONCURRENCY 1000
+/* upper limit for effective_io_concurrency (better to he power of 2) */
+#define MAX_IO_CONCURRENCY 1024
 
 /* special block number for ReadBuffer() */
 #define P_NEW	InvalidBlockNumber	/* grow the file to get a new page */

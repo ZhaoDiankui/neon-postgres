@@ -32,6 +32,11 @@ extern int	sync_method;
 extern PGDLLIMPORT TimeLineID ThisTimeLineID;	/* current TLI */
 
 /*
+ * Pseudo block number used to associate LSN with relation metadata (relation size)
+ */
+#define REL_METADATA_PSEUDO_BLOCKNO InvalidBlockNumber
+
+/*
  * Prior to 8.4, all activity during recovery was carried out by the startup
  * process. This local variable continues to be used in many parts of the
  * code to indicate actions taken by RecoveryManagers. Other processes that
@@ -132,6 +137,7 @@ extern char *PrimaryConnInfo;
 extern char *PrimarySlotName;
 extern bool wal_receiver_create_temp_slot;
 extern bool track_wal_io_timing;
+extern int  lastWrittenLsnCacheSize;
 
 /* indirectly set via GUC system */
 extern TransactionId recoveryTargetXid;
@@ -307,6 +313,7 @@ extern void XLogSetReplicationSlotMinimumLSN(XLogRecPtr lsn);
 extern void xlog_redo(XLogReaderState *record);
 extern void xlog_desc(StringInfo buf, XLogReaderState *record);
 extern const char *xlog_identify(uint8 info);
+extern void xlog_outdesc(StringInfo buf, XLogReaderState *record);
 
 extern void issue_xlog_fsync(int fd, XLogSegNo segno);
 
@@ -316,6 +323,7 @@ extern bool HotStandbyActive(void);
 extern bool HotStandbyActiveInReplay(void);
 extern bool XLogInsertAllowed(void);
 extern void GetXLogReceiptTime(TimestampTz *rtime, bool *fromStream);
+extern void XLogWaitForReplayOf(XLogRecPtr redoEndRecPtr);
 extern XLogRecPtr GetXLogReplayRecPtr(TimeLineID *replayTLI);
 extern XLogRecPtr GetXLogInsertRecPtr(void);
 extern XLogRecPtr GetXLogWriteRecPtr(void);
@@ -349,6 +357,17 @@ extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 extern void RemovePromoteSignalFiles(void);
+
+extern void SetLastWrittenLSNForBlock(XLogRecPtr lsn, RelFileNode relfilenode, ForkNumber forknum, BlockNumber blkno);
+extern void SetLastWrittenLSNForBlockRange(XLogRecPtr lsn, RelFileNode relfilenode, ForkNumber forknum, BlockNumber from, BlockNumber n_blocks);
+extern void SetLastWrittenLSNForDatabase(XLogRecPtr lsn);
+extern void SetLastWrittenLSNForRelation(XLogRecPtr lsn, RelFileNode relfilenode, ForkNumber forknum);
+extern XLogRecPtr GetLastWrittenLSN(RelFileNode relfilenode, ForkNumber forknum, BlockNumber blkno);
+
+extern XLogRecPtr GetRedoStartLsn(void);
+
+extern void SetZenithCurrentClusterSize(uint64 size);
+extern uint64 GetZenithCurrentClusterSize(void);
 
 extern bool PromoteIsTriggered(void);
 extern bool CheckPromoteSignal(void);
@@ -399,6 +418,8 @@ extern SessionBackupState get_backup_status(void);
 
 #define TABLESPACE_MAP			"tablespace_map"
 #define TABLESPACE_MAP_OLD		"tablespace_map.old"
+
+#define ZENITH_SIGNAL_FILE		"zenith.signal"
 
 /* files to signal promotion to primary */
 #define PROMOTE_SIGNAL_FILE		"promote"

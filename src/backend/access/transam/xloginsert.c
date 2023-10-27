@@ -29,9 +29,11 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
+#include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 /* Buffer size required to store a compressed version of backup block image */
 #define PGLZ_MAX_BLCKSZ PGLZ_MAX_OUTPUT(BLCKSZ)
@@ -60,6 +62,11 @@ typedef struct
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[PGLZ_MAX_BLCKSZ];
 } registered_buffer;
+
+/* GUCs */
+int			max_replication_apply_lag;
+int			max_replication_flush_lag;
+int			max_replication_write_lag;
 
 static registered_buffer *registered_buffers;
 static int	max_registered_buffers; /* allocated size */
@@ -449,6 +456,11 @@ XLogInsert(RmgrId rmid, uint8 info)
 		XLogResetInsertion();
 		EndPos = SizeOfXLogLongPHD; /* start of 1st chkpt record */
 		return EndPos;
+	}
+
+	if (delay_backend_us != NULL && delay_backend_us() > 0)
+	{
+		InterruptPending = true;
 	}
 
 	do
@@ -1170,6 +1182,10 @@ log_newpage_range(Relation rel, ForkNumber forkNum,
 				UnlockReleaseBuffer(buf);
 			blkno++;
 		}
+
+		/* Nothing more to do if all remaining blocks were empty. */
+		if (nbufs == 0)
+			break;
 
 		/* Write WAL record for this batch. */
 		XLogBeginInsert();

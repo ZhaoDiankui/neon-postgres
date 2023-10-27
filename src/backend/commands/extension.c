@@ -399,6 +399,7 @@ get_extension_script_directory(ExtensionControlFile *control)
 {
 	char		sharepath[MAXPGPATH];
 	char	   *result;
+	struct stat fst;
 
 	/*
 	 * The directory parameter can be omitted, absolute, or relative to the
@@ -413,6 +414,16 @@ get_extension_script_directory(ExtensionControlFile *control)
 	get_share_path(my_exec_path, sharepath);
 	result = (char *) palloc(MAXPGPATH);
 	snprintf(result, MAXPGPATH, "%s/%s", sharepath, control->directory);
+
+	// If directory does not exist, check remote extension storage
+	if (stat(result, &fst) < 0)
+	{
+		// request download of extension files from for control->directory
+		if (download_extension_file_hook != NULL)
+		{
+			download_extension_file_hook(control->directory, false);
+		}
+	}
 
 	return result;
 }
@@ -958,6 +969,16 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		char	   *c_sql = read_extension_script_file(control, filename);
 		Datum		t_sql;
 
+		/*
+		 * We filter each substitution through quote_identifier().  When the
+		 * arg contains one of the following characters, no one collection of
+		 * quoting can work inside $$dollar-quoted string literals$$,
+		 * 'single-quoted string literals', and outside of any literal.  To
+		 * avoid a security snare for extension authors, error on substitution
+		 * for arguments containing these.
+		 */
+		const char *quoting_relevant_chars = "\"$'\\";
+
 		/* We use various functions that want to operate on text datums */
 		t_sql = CStringGetTextDatum(c_sql);
 
@@ -987,6 +1008,11 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 											t_sql,
 											CStringGetTextDatum("@extowner@"),
 											CStringGetTextDatum(qUserName));
+			if (strpbrk(userName, quoting_relevant_chars))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid character in extension owner: must not contain any of \"%s\"",
+								quoting_relevant_chars)));
 		}
 
 		/*
@@ -998,6 +1024,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		 */
 		if (!control->relocatable)
 		{
+			Datum		old = t_sql;
 			const char *qSchemaName = quote_identifier(schemaName);
 
 			t_sql = DirectFunctionCall3Coll(replace_text,
@@ -1005,6 +1032,11 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 											t_sql,
 											CStringGetTextDatum("@extschema@"),
 											CStringGetTextDatum(qSchemaName));
+			if (t_sql != old && strpbrk(schemaName, quoting_relevant_chars))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid character in extension \"%s\" schema: must not contain any of \"%s\"",
+								control->name, quoting_relevant_chars)));
 		}
 
 		/*
@@ -1417,6 +1449,13 @@ CreateExtensionInternal(char *extensionName,
 	 * will get us there.
 	 */
 	filename = get_extension_script_filename(pcontrol, NULL, versionName);
+
+	// request download of extension files from compute_ctl
+	if (download_extension_file_hook != NULL)
+	{
+		download_extension_file_hook(extensionName, false);
+	}
+
 	if (stat(filename, &fst) == 0)
 	{
 		/* Easy, no extra scripts */
@@ -2789,7 +2828,7 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 {
 	Oid			extensionOid;
 	Oid			nspOid;
-	Oid			oldNspOid = InvalidOid;
+	Oid			oldNspOid;
 	AclResult	aclresult;
 	Relation	extRel;
 	ScanKeyData key[2];
@@ -2872,6 +2911,9 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 
 	objsMoved = new_object_addresses();
 
+	/* store the OID of the namespace to-be-changed */
+	oldNspOid = extForm->extnamespace;
+
 	/*
 	 * Scan pg_depend to find objects that depend directly on the extension,
 	 * and alter each one's schema.
@@ -2916,12 +2958,6 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 												 dep.objectId,
 												 nspOid,
 												 objsMoved);
-
-		/*
-		 * Remember previous namespace of first object that has one
-		 */
-		if (oldNspOid == InvalidOid && dep_oldNspOid != InvalidOid)
-			oldNspOid = dep_oldNspOid;
 
 		/*
 		 * If not all the objects had the same old namespace (ignoring any

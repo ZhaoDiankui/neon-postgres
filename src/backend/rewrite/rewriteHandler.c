@@ -26,6 +26,7 @@
 #include "catalog/dependency.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
+#include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -353,6 +354,7 @@ rewriteRuleAction(Query *parsetree,
 	Query	   *sub_action;
 	Query	  **sub_action_ptr;
 	acquireLocksOnSubLinks_context context;
+	ListCell   *lc;
 
 	context.for_execute = true;
 
@@ -392,6 +394,23 @@ rewriteRuleAction(Query *parsetree,
 				   PRS2_OLD_VARNO + rt_length, rt_index, 0);
 
 	/*
+	 * Mark any subquery RTEs in the rule action as LATERAL if they contain
+	 * Vars referring to the current query level (references to NEW/OLD).
+	 * Those really are lateral references, but we've historically not
+	 * required users to mark such subqueries with LATERAL explicitly.  But
+	 * the planner will complain if such Vars exist in a non-LATERAL subquery,
+	 * so we have to fix things up here.
+	 */
+	foreach(lc, sub_action->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_SUBQUERY && !rte->lateral &&
+			contain_vars_of_level((Node *) rte->subquery, 1))
+			rte->lateral = true;
+	}
+
+	/*
 	 * Generate expanded rtable consisting of main parsetree's rtable plus
 	 * rule action's rtable; this becomes the complete rtable for the rule
 	 * action.  Some of the entries may be unused after we finish rewriting,
@@ -418,6 +437,10 @@ rewriteRuleAction(Query *parsetree,
 	 * NOTE: because planner will destructively alter rtable, we must ensure
 	 * that rule action's rtable is separate and shares no substructure with
 	 * the main rtable.  Hence do a deep copy here.
+	 *
+	 * Note also that RewriteQuery() relies on the fact that RT entries from
+	 * the original query appear at the start of the expanded rtable, so
+	 * beware of changing this.
 	 */
 	sub_action->rtable = list_concat(copyObject(parsetree->rtable),
 									 sub_action->rtable);
@@ -428,8 +451,6 @@ rewriteRuleAction(Query *parsetree,
 	 */
 	if (parsetree->hasSubLinks && !sub_action->hasSubLinks)
 	{
-		ListCell   *lc;
-
 		foreach(lc, parsetree->rtable)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
@@ -456,6 +477,8 @@ rewriteRuleAction(Query *parsetree,
 					/* other RTE types don't contain bare expressions */
 					break;
 			}
+			sub_action->hasSubLinks |=
+				checkExprHasSubLink((Node *) rte->securityQuals);
 			if (sub_action->hasSubLinks)
 				break;			/* no need to keep scanning rtable */
 		}
@@ -527,8 +550,6 @@ rewriteRuleAction(Query *parsetree,
 	 */
 	if (parsetree->cteList != NIL && sub_action->commandType != CMD_UTILITY)
 	{
-		ListCell   *lc;
-
 		/*
 		 * Annoying implementation restriction: because CTEs are identified by
 		 * name within a cteList, we can't merge a CTE from the original query
@@ -1593,7 +1614,6 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
 	List	   *newValues;
 	ListCell   *lc;
 
-	Assert(rte->rtekind == RTE_VALUES);
 	newValues = NIL;
 	foreach(lc, rte->values_lists)
 	{
@@ -1619,43 +1639,6 @@ rewriteValuesRTEToNulls(Query *parsetree, RangeTblEntry *rte)
 		newValues = lappend(newValues, newList);
 	}
 	rte->values_lists = newValues;
-}
-
-
-/*
- * Record in target_rte->extraUpdatedCols the indexes of any generated columns
- * that depend on any columns mentioned in target_rte->updatedCols.
- */
-void
-fill_extraUpdatedCols(RangeTblEntry *target_rte, Relation target_relation)
-{
-	TupleDesc	tupdesc = RelationGetDescr(target_relation);
-	TupleConstr *constr = tupdesc->constr;
-
-	target_rte->extraUpdatedCols = NULL;
-
-	if (constr && constr->has_generated_stored)
-	{
-		for (int i = 0; i < constr->num_defval; i++)
-		{
-			AttrDefault *defval = &constr->defval[i];
-			Node	   *expr;
-			Bitmapset  *attrs_used = NULL;
-
-			/* skip if not generated column */
-			if (!TupleDescAttr(tupdesc, defval->adnum - 1)->attgenerated)
-				continue;
-
-			/* identify columns this generated column depends on */
-			expr = stringToNode(defval->adbin);
-			pull_varattnos(expr, 1, &attrs_used);
-
-			if (bms_overlap(target_rte->updatedCols, attrs_used))
-				target_rte->extraUpdatedCols =
-					bms_add_member(target_rte->extraUpdatedCols,
-								   defval->adnum - FirstLowInvalidHeapAttributeNumber);
-		}
-	}
 }
 
 
@@ -1740,6 +1723,7 @@ ApplyRetrieveRule(Query *parsetree,
 	RangeTblEntry *rte,
 			   *subrte;
 	RowMarkClause *rc;
+	int			numCols;
 
 	if (list_length(rule->actions) != 1)
 		elog(ERROR, "expected just one rule action");
@@ -1898,6 +1882,20 @@ ApplyRetrieveRule(Query *parsetree,
 	rte->insertedCols = NULL;
 	rte->updatedCols = NULL;
 	rte->extraUpdatedCols = NULL;
+
+	/*
+	 * Since we allow CREATE OR REPLACE VIEW to add columns to a view, the
+	 * rule_action might emit more columns than we expected when the current
+	 * query was parsed.  Various places expect rte->eref->colnames to be
+	 * consistent with the non-junk output columns of the subquery, so patch
+	 * things up if necessary by adding some dummy column names.
+	 */
+	numCols = ExecCleanTargetListLength(rule_action->targetList);
+	while (list_length(rte->eref->colnames) < numCols)
+	{
+		rte->eref->colnames = lappend(rte->eref->colnames,
+									  makeString(pstrdup("?column?")));
+	}
 
 	return parsetree;
 }
@@ -3342,7 +3340,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 								  view_targetlist,
 								  REPLACEVARS_REPORT_ERROR,
 								  0,
-								  &parsetree->hasSubLinks);
+								  NULL);
 
 	/*
 	 * Update all other RTI references in the query that point to the view
@@ -3362,7 +3360,7 @@ rewriteTargetView(Query *parsetree, Relation view)
 	 * columns to be affected.
 	 *
 	 * Note that this destroys the resno ordering of the targetlist, but that
-	 * will be fixed when we recurse through rewriteQuery, which will invoke
+	 * will be fixed when we recurse through RewriteQuery, which will invoke
 	 * rewriteTargetListIU again on the updated targetlist.
 	 */
 	if (parsetree->commandType != CMD_DELETE)
@@ -3612,9 +3610,13 @@ rewriteTargetView(Query *parsetree, Relation view)
  *
  * rewrite_events is a list of open query-rewrite actions, so we can detect
  * infinite recursion.
+ *
+ * orig_rt_length is the length of the originating query's rtable, for product
+ * queries created by fireRules(), and 0 otherwise.  This is used to skip any
+ * already-processed VALUES RTEs from the original query.
  */
 static List *
-RewriteQuery(Query *parsetree, List *rewrite_events)
+RewriteQuery(Query *parsetree, List *rewrite_events, int orig_rt_length)
 {
 	CmdType		event = parsetree->commandType;
 	bool		instead = false;
@@ -3638,7 +3640,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		if (ctequery->commandType == CMD_SELECT)
 			continue;
 
-		newstuff = RewriteQuery(ctequery, rewrite_events);
+		newstuff = RewriteQuery(ctequery, rewrite_events, 0);
 
 		/*
 		 * Currently we can only handle unconditional, single-statement DO
@@ -3712,6 +3714,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		RangeTblEntry *rt_entry;
 		Relation	rt_entry_relation;
 		List	   *locks;
+		int			product_orig_rt_length;
 		List	   *product_queries;
 		bool		hasUpdate = false;
 		int			values_rte_index = 0;
@@ -3733,23 +3736,30 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		 */
 		if (event == CMD_INSERT)
 		{
+			ListCell   *lc2;
 			RangeTblEntry *values_rte = NULL;
 
 			/*
-			 * If it's an INSERT ... VALUES (...), (...), ... there will be a
-			 * single RTE for the VALUES targetlists.
+			 * Test if it's a multi-row INSERT ... VALUES (...), (...), ... by
+			 * looking for a VALUES RTE in the fromlist.  For product queries,
+			 * we must ignore any already-processed VALUES RTEs from the
+			 * original query.  These appear at the start of the rangetable.
 			 */
-			if (list_length(parsetree->jointree->fromlist) == 1)
+			foreach(lc2, parsetree->jointree->fromlist)
 			{
-				RangeTblRef *rtr = (RangeTblRef *) linitial(parsetree->jointree->fromlist);
+				RangeTblRef *rtr = (RangeTblRef *) lfirst(lc2);
 
-				if (IsA(rtr, RangeTblRef))
+				if (IsA(rtr, RangeTblRef) && rtr->rtindex > orig_rt_length)
 				{
 					RangeTblEntry *rte = rt_fetch(rtr->rtindex,
 												  parsetree->rtable);
 
 					if (rte->rtekind == RTE_VALUES)
 					{
+						/* should not find more than one VALUES RTE */
+						if (values_rte != NULL)
+							elog(ERROR, "more than one VALUES RTE found");
+
 						values_rte = rte;
 						values_rte_index = rtr->rtindex;
 					}
@@ -3804,9 +3814,6 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 									parsetree->override,
 									rt_entry_relation,
 									NULL, 0, NULL);
-
-			/* Also populate extraUpdatedCols (for generated columns) */
-			fill_extraUpdatedCols(rt_entry, rt_entry_relation);
 		}
 		else if (event == CMD_DELETE)
 		{
@@ -3821,6 +3828,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		locks = matchLocks(event, rt_entry_relation->rd_rules,
 						   result_relation, parsetree, &hasUpdate);
 
+		product_orig_rt_length = list_length(parsetree->rtable);
 		product_queries = fireRules(parsetree,
 									result_relation,
 									event,
@@ -3844,12 +3852,39 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 			/*
 			 * Each product query has its own copy of the VALUES RTE at the
 			 * same index in the rangetable, so we must finalize each one.
+			 *
+			 * Note that if the product query is an INSERT ... SELECT, then
+			 * the VALUES RTE will be at the same index in the SELECT part of
+			 * the product query rather than the top-level product query
+			 * itself.
 			 */
 			foreach(n, product_queries)
 			{
 				Query	   *pt = (Query *) lfirst(n);
-				RangeTblEntry *values_rte = rt_fetch(values_rte_index,
-													 pt->rtable);
+				RangeTblEntry *values_rte;
+
+				if (pt->commandType == CMD_INSERT &&
+					pt->jointree && IsA(pt->jointree, FromExpr) &&
+					list_length(pt->jointree->fromlist) == 1)
+				{
+					Node	   *jtnode = (Node *) linitial(pt->jointree->fromlist);
+
+					if (IsA(jtnode, RangeTblRef))
+					{
+						int			rtindex = ((RangeTblRef *) jtnode)->rtindex;
+						RangeTblEntry *src_rte = rt_fetch(rtindex, pt->rtable);
+
+						if (src_rte->rtekind == RTE_SUBQUERY &&
+							src_rte->subquery &&
+							IsA(src_rte->subquery, Query) &&
+							src_rte->subquery->commandType == CMD_SELECT)
+							pt = src_rte->subquery;
+					}
+				}
+
+				values_rte = rt_fetch(values_rte_index, pt->rtable);
+				if (values_rte->rtekind != RTE_VALUES)
+					elog(ERROR, "failed to find VALUES RTE in product query");
 
 				rewriteValuesRTEToNulls(pt, values_rte);
 			}
@@ -3977,7 +4012,19 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 				Query	   *pt = (Query *) lfirst(n);
 				List	   *newstuff;
 
-				newstuff = RewriteQuery(pt, rewrite_events);
+				/*
+				 * For an updatable view, pt might be the rewritten version of
+				 * the original query, in which case we pass on orig_rt_length
+				 * to finish processing any VALUES RTE it contained.
+				 *
+				 * Otherwise, we have a product query created by fireRules().
+				 * Any VALUES RTEs from the original query have been fully
+				 * processed, and must be skipped when we recurse.
+				 */
+				newstuff = RewriteQuery(pt, rewrite_events,
+										pt == parsetree ?
+										orig_rt_length :
+										product_orig_rt_length);
 				rewritten = list_concat(rewritten, newstuff);
 			}
 
@@ -4129,7 +4176,7 @@ QueryRewrite(Query *parsetree)
 	 *
 	 * Apply all non-SELECT rules possibly getting 0 or many queries
 	 */
-	querylist = RewriteQuery(parsetree, NIL);
+	querylist = RewriteQuery(parsetree, NIL, 0);
 
 	/*
 	 * Step 2

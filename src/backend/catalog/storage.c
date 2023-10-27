@@ -143,7 +143,7 @@ RelationCreateStorage(RelFileNode rnode, char relpersistence)
 			return NULL;		/* placate compiler */
 	}
 
-	srel = smgropen(rnode, backend);
+	srel = smgropen(rnode, backend, relpersistence);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (needs_wal)
@@ -175,6 +175,7 @@ void
 log_smgrcreate(const RelFileNode *rnode, ForkNumber forkNum)
 {
 	xl_smgr_create xlrec;
+	XLogRecPtr lsn;
 
 	/*
 	 * Make an XLOG entry reporting the file creation.
@@ -184,7 +185,8 @@ log_smgrcreate(const RelFileNode *rnode, ForkNumber forkNum)
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+	SetLastWrittenLSNForRelation(lsn, *rnode, forkNum);
 }
 
 /*
@@ -282,16 +284,16 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	ForkNumber	forks[MAX_FORKNUM];
 	BlockNumber blocks[MAX_FORKNUM];
 	int			nforks = 0;
-
-	/* Open it at the smgr level if not already done */
-	RelationOpenSmgr(rel);
+	SMgrRelation reln;
 
 	/*
-	 * Make sure smgr_targblock etc aren't pointing somewhere past new end
+	 * Make sure smgr_targblock etc aren't pointing somewhere past new end.
+	 * (Note: don't rely on this reln pointer below this loop.)
 	 */
-	rel->rd_smgr->smgr_targblock = InvalidBlockNumber;
+	reln = RelationGetSmgr(rel);
+	reln->smgr_targblock = InvalidBlockNumber;
 	for (int i = 0; i <= MAX_FORKNUM; ++i)
-		rel->rd_smgr->smgr_cached_nblocks[i] = InvalidBlockNumber;
+		reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
 
 	/* Prepare for truncation of MAIN fork of the relation */
 	forks[nforks] = MAIN_FORKNUM;
@@ -299,7 +301,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	nforks++;
 
 	/* Prepare for truncation of the FSM if it exists */
-	fsm = smgrexists(rel->rd_smgr, FSM_FORKNUM);
+	fsm = smgrexists(RelationGetSmgr(rel), FSM_FORKNUM);
 	if (fsm)
 	{
 		blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, nblocks);
@@ -312,7 +314,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	}
 
 	/* Prepare for truncation of the visibility map too if it exists */
-	vm = smgrexists(rel->rd_smgr, VISIBILITYMAP_FORKNUM);
+	vm = smgrexists(RelationGetSmgr(rel), VISIBILITYMAP_FORKNUM);
 	if (vm)
 	{
 		blocks[nforks] = visibilitymap_prepare_truncate(rel, nblocks);
@@ -384,7 +386,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * longer exist after truncation is complete, and then truncate the
 	 * corresponding files on disk.
 	 */
-	smgrtruncate(rel->rd_smgr, forks, nforks, blocks);
+	smgrtruncate(RelationGetSmgr(rel), forks, nforks, blocks);
 
 	/* We've done all the critical work, so checkpoints are OK now. */
 	MyProc->delayChkptEnd = false;
@@ -416,9 +418,9 @@ RelationPreTruncate(Relation rel)
 
 	if (!pendingSyncHash)
 		return;
-	RelationOpenSmgr(rel);
 
-	pending = hash_search(pendingSyncHash, &(rel->rd_smgr->smgr_rnode.node),
+	pending = hash_search(pendingSyncHash,
+						  &(RelationGetSmgr(rel)->smgr_rnode.node),
 						  HASH_FIND, NULL);
 	if (pending)
 		pending->is_truncated = true;
@@ -430,6 +432,12 @@ RelationPreTruncate(Relation rel)
  * Note that this requires that there is no dirty data in shared buffers. If
  * it's possible that there are, callers need to flush those using
  * e.g. FlushRelationBuffers(rel).
+ *
+ * Also note that this is frequently called via locutions such as
+ *		RelationCopyStorage(RelationGetSmgr(rel), ...);
+ * That's safe only because we perform only smgr and WAL operations here.
+ * If we invoked anything else, a relcache flush could cause our SMgrRelation
+ * argument to become a dangling pointer.
  */
 void
 RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
@@ -472,13 +480,23 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 
 		if (!PageIsVerifiedExtended(page, blkno,
 									PIV_LOG_WARNING | PIV_REPORT_STAT))
+		{
+			/*
+			 * For paranoia's sake, capture the file path before invoking the
+			 * ereport machinery.  This guards against the possibility of a
+			 * relcache flush caused by, e.g., an errcontext callback.
+			 * (errcontext callbacks shouldn't be risking any such thing, but
+			 * people have been known to forget that rule.)
+			 */
+			char	   *relpath = relpathbackend(src->smgr_rnode.node,
+												 src->smgr_rnode.backend,
+												 forkNum);
+
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid page in block %u of relation %s",
-							blkno,
-							relpathbackend(src->smgr_rnode.node,
-										   src->smgr_rnode.backend,
-										   forkNum))));
+							blkno, relpath)));
+		}
 
 		/*
 		 * WAL-log the copied page. Unfortunately we don't know what kind of a
@@ -651,7 +669,7 @@ smgrDoPendingDeletes(bool isCommit)
 			{
 				SMgrRelation srel;
 
-				srel = smgropen(pending->relnode, pending->backend);
+				srel = smgropen(pending->relnode, pending->backend, 0);
 
 				/* allocate the initial array, or extend it, if needed */
 				if (maxrels == 0)
@@ -732,7 +750,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber total_blocks = 0;
 		SMgrRelation srel;
 
-		srel = smgropen(pendingsync->rnode, InvalidBackendId);
+		srel = smgropen(pendingsync->rnode, InvalidBackendId, 0);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.
@@ -941,7 +959,7 @@ smgr_redo(XLogReaderState *record)
 		xl_smgr_create *xlrec = (xl_smgr_create *) XLogRecGetData(record);
 		SMgrRelation reln;
 
-		reln = smgropen(xlrec->rnode, InvalidBackendId);
+		reln = smgropen(xlrec->rnode, InvalidBackendId, RELPERSISTENCE_PERMANENT);
 		smgrcreate(reln, xlrec->forkNum, true);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
@@ -954,7 +972,7 @@ smgr_redo(XLogReaderState *record)
 		int			nforks = 0;
 		bool		need_fsm_vacuum = false;
 
-		reln = smgropen(xlrec->rnode, InvalidBackendId);
+		reln = smgropen(xlrec->rnode, InvalidBackendId, RELPERSISTENCE_PERMANENT);
 
 		/*
 		 * Forcibly create relation if it doesn't exist (which suggests that

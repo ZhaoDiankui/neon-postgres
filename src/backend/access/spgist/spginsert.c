@@ -85,6 +85,8 @@ spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
 
+	smgr_start_unlogged_build(index->rd_smgr);
+
 	/*
 	 * Initialize the meta page and root pages
 	 */
@@ -131,6 +133,8 @@ spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	SpGistUpdateMetaPage(index);
 
+	smgr_finish_unlogged_build_phase_1(index->rd_smgr);
+
 	/*
 	 * We didn't write WAL records as we built the index, so if WAL-logging is
 	 * required, write all pages to the WAL now.
@@ -140,7 +144,12 @@ spgbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		log_newpage_range(index, MAIN_FORKNUM,
 						  0, RelationGetNumberOfBlocks(index),
 						  true);
+		SetLastWrittenLSNForBlockRange(XactLastRecEnd, index->rd_smgr->smgr_rnode.node,
+						  MAIN_FORKNUM, 0, RelationGetNumberOfBlocks(index));
+		SetLastWrittenLSNForRelation(XactLastRecEnd, index->rd_smgr->smgr_rnode.node, MAIN_FORKNUM);
 	}
+
+	smgr_end_unlogged_build(index->rd_smgr);
 
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 	result->heap_tuples = reltuples;
@@ -169,27 +178,27 @@ spgbuildempty(Relation index)
 	 * replayed.
 	 */
 	PageSetChecksumInplace(page, SPGIST_METAPAGE_BLKNO);
-	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_METAPAGE_BLKNO,
+	smgrwrite(RelationGetSmgr(index), INIT_FORKNUM, SPGIST_METAPAGE_BLKNO,
 			  (char *) page, true);
-	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+	log_newpage(&(RelationGetSmgr(index))->smgr_rnode.node, INIT_FORKNUM,
 				SPGIST_METAPAGE_BLKNO, page, true);
 
 	/* Likewise for the root page. */
 	SpGistInitPage(page, SPGIST_LEAF);
 
 	PageSetChecksumInplace(page, SPGIST_ROOT_BLKNO);
-	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_ROOT_BLKNO,
+	smgrwrite(RelationGetSmgr(index), INIT_FORKNUM, SPGIST_ROOT_BLKNO,
 			  (char *) page, true);
-	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+	log_newpage(&(RelationGetSmgr(index))->smgr_rnode.node, INIT_FORKNUM,
 				SPGIST_ROOT_BLKNO, page, true);
 
 	/* Likewise for the null-tuples root page. */
 	SpGistInitPage(page, SPGIST_LEAF | SPGIST_NULLS);
 
 	PageSetChecksumInplace(page, SPGIST_NULL_BLKNO);
-	smgrwrite(index->rd_smgr, INIT_FORKNUM, SPGIST_NULL_BLKNO,
+	smgrwrite(RelationGetSmgr(index), INIT_FORKNUM, SPGIST_NULL_BLKNO,
 			  (char *) page, true);
-	log_newpage(&index->rd_smgr->smgr_rnode.node, INIT_FORKNUM,
+	log_newpage(&(RelationGetSmgr(index))->smgr_rnode.node, INIT_FORKNUM,
 				SPGIST_NULL_BLKNO, page, true);
 
 	/*
@@ -197,7 +206,7 @@ spgbuildempty(Relation index)
 	 * writes did not go through shared buffers and therefore a concurrent
 	 * checkpoint may have moved the redo pointer past our xlog record.
 	 */
-	smgrimmedsync(index->rd_smgr, INIT_FORKNUM);
+	smgrimmedsync(RelationGetSmgr(index), INIT_FORKNUM);
 }
 
 /*

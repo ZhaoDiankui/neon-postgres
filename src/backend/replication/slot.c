@@ -45,6 +45,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/slot.h"
+#include "replication/message.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -605,6 +606,15 @@ ReplicationSlotDropPtr(ReplicationSlot *slot)
 	sprintf(path, "pg_replslot/%s", NameStr(slot->data.name));
 	sprintf(tmppath, "pg_replslot/%s.tmp", NameStr(slot->data.name));
 
+	if (SlotIsLogical(slot))
+	{
+		/* NEON specific: delete slot from storage using logical message */
+		char		prefix[MAXPGPATH];
+		snprintf(prefix, sizeof(prefix), "neon-file:%s/state", path);
+		elog(LOG, "Drop replication slot %s", path);
+		LogLogicalMessage(prefix, NULL, 0, false);
+	}
+
 	/*
 	 * Rename the slot directory on disk, so that we'll no longer recognize
 	 * this as a valid slot.  Note that if this fails, we've got to mark the
@@ -778,6 +788,7 @@ ReplicationSlotsComputeRequiredXmin(bool already_locked)
 		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
 		TransactionId effective_xmin;
 		TransactionId effective_catalog_xmin;
+		bool		invalidated;
 
 		if (!s->in_use)
 			continue;
@@ -785,7 +796,13 @@ ReplicationSlotsComputeRequiredXmin(bool already_locked)
 		SpinLockAcquire(&s->mutex);
 		effective_xmin = s->effective_xmin;
 		effective_catalog_xmin = s->effective_catalog_xmin;
+		invalidated = (!XLogRecPtrIsInvalid(s->data.invalidated_at) &&
+					   XLogRecPtrIsInvalid(s->data.restart_lsn));
 		SpinLockRelease(&s->mutex);
+
+		/* invalidated slots need not apply */
+		if (invalidated)
+			continue;
 
 		/* check the data xmin */
 		if (TransactionIdIsValid(effective_xmin) &&
@@ -1561,6 +1578,15 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 				(char *) (&cp) + SnapBuildOnDiskNotChecksummedSize,
 				SnapBuildOnDiskChecksummedSize);
 	FIN_CRC32C(cp.checksum);
+
+	if (SlotIsLogical(slot) && cp.slotdata.restart_lsn != InvalidXLogRecPtr)
+	{
+		/* NEON specific: persist slot in storage using logical message */
+		char		prefix[MAXPGPATH];
+		snprintf(prefix, sizeof(prefix), "neon-file:%s", path);
+		elog(LOG, "Save replication slot at %s restart_lsn=%X/%X", path, 	LSN_FORMAT_ARGS(cp.slotdata.restart_lsn));
+		LogLogicalMessage(prefix, (char*)&cp, sizeof cp, false);
+	}
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_REPLICATION_SLOT_WRITE);

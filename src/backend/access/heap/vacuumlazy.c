@@ -68,6 +68,7 @@
 #include "commands/vacuum.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
+#include "optimizer/cost.h"
 #include "optimizer/paths.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
@@ -79,6 +80,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/spccache.h"
 #include "utils/timestamp.h"
 
 
@@ -308,6 +310,9 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+
+	/* prefetch */
+	int			io_concurrency;
 
 	/* Wraparound failsafe has been triggered? */
 	bool		failsafe_active;
@@ -555,6 +560,8 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 
 	/* Set up high level stuff about rel */
 	vacrel->rel = rel;
+	vacrel->io_concurrency =
+		get_tablespace_maintenance_io_concurrency(rel->rd_rel->reltablespace);
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
 	vacrel->failsafe_active = false;
@@ -912,6 +919,7 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	BlockNumber nblocks,
 				blkno,
 				next_unskippable_block,
+				next_prefetch_block,
 				next_failsafe_block,
 				next_fsm_block_to_vacuum;
 	PGRUsage	ru0;
@@ -941,6 +949,7 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 
 	nblocks = RelationGetNumberOfBlocks(vacrel->rel);
 	next_unskippable_block = 0;
+	next_prefetch_block = 0;
 	next_failsafe_block = 0;
 	next_fsm_block_to_vacuum = 0;
 	vacrel->rel_pages = nblocks;
@@ -1216,6 +1225,33 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		 * cycle of index vacuuming.
 		 */
 		visibilitymap_pin(vacrel->rel, blkno, &vmbuffer);
+
+		if (vacrel->io_concurrency > 0)
+		{
+			/*
+			 * Prefetch io_concurrency blocks ahead
+			 */
+			uint32 prefetch_budget = vacrel->io_concurrency;
+
+			/* never trail behind the current scan */
+			if (next_prefetch_block < blkno)
+				next_prefetch_block = blkno;
+
+			/* but only up to the end of the relation */
+			if (prefetch_budget > vacrel->rel_pages - next_prefetch_block)
+				prefetch_budget = vacrel->rel_pages - next_prefetch_block;
+
+			/* And only up to io_concurrency ahead of the current vacuum scan */
+			if (next_prefetch_block + prefetch_budget > blkno + vacrel->io_concurrency)
+				prefetch_budget = blkno + vacrel->io_concurrency - next_prefetch_block;
+
+			/* And only up to the next unskippable block */
+			if (next_prefetch_block + prefetch_budget > next_unskippable_block)
+				prefetch_budget = next_unskippable_block - next_prefetch_block;
+
+			for (; prefetch_budget-- > 0; next_prefetch_block++)
+				PrefetchBuffer(vacrel->rel, MAIN_FORKNUM, next_prefetch_block);
+		}
 
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno,
 								 RBM_NORMAL, vacrel->bstrategy);
@@ -2314,7 +2350,8 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 static void
 lazy_vacuum_heap_rel(LVRelState *vacrel)
 {
-	int			tupindex;
+	int			tupindex,
+				ptupindex;
 	BlockNumber vacuumed_pages;
 	PGRUsage	ru0;
 	Buffer		vmbuffer = InvalidBuffer;
@@ -2337,6 +2374,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 	vacuumed_pages = 0;
 
 	tupindex = 0;
+	ptupindex = 0;
 	while (tupindex < vacrel->dead_tuples->num_tuples)
 	{
 		BlockNumber tblk;
@@ -2347,6 +2385,43 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		vacuum_delay_point();
 
 		tblk = ItemPointerGetBlockNumber(&vacrel->dead_tuples->itemptrs[tupindex]);
+
+		if (vacrel->io_concurrency > 0)
+		{
+			/*
+			 * If we're just starting out, prefetch N consecutive blocks.
+			 * If not, only the next 1 block
+			 */
+			if (ptupindex == 0) {
+				int prefetch_budget = Min(vacrel->dead_tuples->num_tuples,
+										  Min(vacrel->rel_pages,
+											  vacrel->io_concurrency));
+				BlockNumber prev_prefetch = ItemPointerGetBlockNumber(&vacrel->dead_tuples->itemptrs[ptupindex]);
+
+				RelationOpenSmgr(vacrel->rel);
+				PrefetchBuffer(vacrel->rel, MAIN_FORKNUM, prev_prefetch);
+
+				while (++ptupindex < vacrel->dead_tuples->num_tuples &&
+					   prefetch_budget > 0) {
+					ItemPointer ptr = &vacrel->dead_tuples->itemptrs[ptupindex];
+					if (ItemPointerGetBlockNumber(ptr) != prev_prefetch) {
+						prev_prefetch = ItemPointerGetBlockNumber(ptr);
+						prefetch_budget -= 1;
+						PrefetchBuffer(vacrel->rel, MAIN_FORKNUM, prev_prefetch);
+					}
+				}
+			} else if (ptupindex < vacrel->dead_tuples->num_tuples) {
+				BlockNumber previous = ItemPointerGetBlockNumber(&vacrel->dead_tuples->itemptrs[ptupindex]);
+				while (++ptupindex < vacrel->dead_tuples->num_tuples) {
+					BlockNumber toPrefetch = ItemPointerGetBlockNumber(&vacrel->dead_tuples->itemptrs[ptupindex]);
+					if (previous != toPrefetch) {
+						PrefetchBuffer(vacrel->rel, MAIN_FORKNUM, toPrefetch);
+						break;
+					}
+				}
+			}
+		}
+
 		vacrel->blkno = tblk;
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, tblk, RBM_NORMAL,
 								 vacrel->bstrategy);
