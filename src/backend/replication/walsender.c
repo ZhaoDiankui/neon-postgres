@@ -129,6 +129,12 @@ bool		log_replication_commands = false;
  */
 bool		wake_wal_senders = false;
 
+
+/*
+ * Backpressure hook, detecting how much we should delay.
+ */
+uint64 (*delay_backend_us)(void) = NULL;
+
 /*
  * xlogreader used for replication.  Note that a WAL sender doing physical
  * replication does not need xlogreader to read WAL, but it needs one to
@@ -250,8 +256,6 @@ static void WalSndPrepareWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, Tran
 static void WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid, bool last_write);
 static void WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid);
 static XLogRecPtr WalSndWaitForWal(XLogRecPtr loc);
-static void LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time);
-static TimeOffset LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now);
 static bool TransactionIdInRecentPast(TransactionId xid, uint32 epoch);
 
 static void WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
@@ -1880,7 +1884,7 @@ ProcessStandbyMessage(void)
 /*
  * Remember that a walreceiver just confirmed receipt of lsn `lsn`.
  */
-static void
+void
 PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 {
 	bool		changed = false;
@@ -1919,14 +1923,7 @@ ProcessStandbyReplyMessage(void)
 				flushPtr,
 				applyPtr;
 	bool		replyRequested;
-	TimeOffset	writeLag,
-				flushLag,
-				applyLag;
-	bool		clearLagTimes;
-	TimestampTz now;
 	TimestampTz replyTime;
-
-	static bool fullyAppliedLastTime = false;
 
 	/* the caller already consumed the msgtype byte */
 	writePtr = pq_getmsgint64(&reply_message);
@@ -1934,6 +1931,33 @@ ProcessStandbyReplyMessage(void)
 	applyPtr = pq_getmsgint64(&reply_message);
 	replyTime = pq_getmsgint64(&reply_message);
 	replyRequested = pq_getmsgbyte(&reply_message);
+	ProcessStandbyReply(writePtr,
+						flushPtr,
+						applyPtr,
+						replyTime,
+						replyRequested);
+
+	elog(LOG, "ProcessStandbyReplyMessage: writelsn %X/%X",
+					LSN_FORMAT_ARGS(writePtr));
+	elog(LOG, "ProcessStandbyReplyMessage: flushlsn %X/%X",
+					LSN_FORMAT_ARGS(flushPtr));
+	elog(LOG, "ProcessStandbyReplyMessage: applylsn %X/%X",
+					LSN_FORMAT_ARGS(applyPtr));
+}
+
+void
+ProcessStandbyReply(XLogRecPtr	writePtr,
+					XLogRecPtr	flushPtr,
+					XLogRecPtr	applyPtr,
+					TimestampTz replyTime,
+					bool		replyRequested)
+{
+	TimeOffset	writeLag,
+				flushLag,
+				applyLag;
+	bool		clearLagTimes;
+	TimestampTz now;
+	static bool fullyAppliedLastTime = false;
 
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -2116,7 +2140,16 @@ ProcessStandbyHSFeedbackMessage(void)
 	feedbackEpoch = pq_getmsgint(&reply_message, 4);
 	feedbackCatalogXmin = pq_getmsgint(&reply_message, 4);
 	feedbackCatalogEpoch = pq_getmsgint(&reply_message, 4);
+	ProcessStandbyHSFeedback(replyTime, feedbackXmin, feedbackEpoch, feedbackCatalogXmin, feedbackCatalogEpoch);
+}
 
+void
+ProcessStandbyHSFeedback(TimestampTz   replyTime,
+						 TransactionId feedbackXmin,
+						 uint32		feedbackEpoch,
+						 TransactionId feedbackCatalogXmin,
+						 uint32		feedbackCatalogEpoch)
+{
 	if (message_level_is_interesting(DEBUG2))
 	{
 		char	   *replyTimeStr;
@@ -2783,30 +2816,33 @@ XLogSendPhysical(void)
 	Assert(nbytes <= MAX_SEND_SIZE);
 
 	/*
-	 * OK to read and send the slice.
-	 */
-	resetStringInfo(&output_message);
-	pq_sendbyte(&output_message, 'w');
+	* OK to read and send the slice.
+	*/
+	if (output_message.data)
+		resetStringInfo(&output_message);
+	else
+		initStringInfo(&output_message);
 
+	pq_sendbyte(&output_message, 'w');
 	pq_sendint64(&output_message, startptr);	/* dataStart */
 	pq_sendint64(&output_message, SendRqstPtr); /* walEnd */
 	pq_sendint64(&output_message, 0);	/* sendtime, filled in last */
 
 	/*
-	 * Read the log directly into the output buffer to avoid extra memcpy
-	 * calls.
-	 */
+	* Read the log directly into the output buffer to avoid extra memcpy
+	* calls.
+	*/
 	enlargeStringInfo(&output_message, nbytes);
 
 retry:
 	if (!WALRead(xlogreader,
-				 &output_message.data[output_message.len],
-				 startptr,
-				 nbytes,
-				 xlogreader->seg.ws_tli,	/* Pass the current TLI because
-											 * only WalSndSegmentOpen controls
-											 * whether new TLI is needed. */
-				 &errinfo))
+				&output_message.data[output_message.len],
+				startptr,
+				nbytes,
+				xlogreader->seg.ws_tli,	/* Pass the current TLI because
+											* only WalSndSegmentOpen controls
+											* whether new TLI is needed. */
+				&errinfo))
 		WALReadRaiseError(&errinfo);
 
 	/* See logical_read_xlog_page(). */
@@ -2814,11 +2850,11 @@ retry:
 	CheckXLogRemoved(segno, xlogreader->seg.ws_tli);
 
 	/*
-	 * During recovery, the currently-open WAL file might be replaced with the
-	 * file of the same name retrieved from archive. So we always need to
-	 * check what we read was valid after reading into the buffer. If it's
-	 * invalid, we try to open and read the file again.
-	 */
+	* During recovery, the currently-open WAL file might be replaced with the
+	* file of the same name retrieved from archive. So we always need to
+	* check what we read was valid after reading into the buffer. If it's
+	* invalid, we try to open and read the file again.
+	*/
 	if (am_cascading_walsender)
 	{
 		WalSnd	   *walsnd = MyWalSnd;
@@ -2968,8 +3004,8 @@ WalSndDone(WalSndSendDataCallback send_data)
 	 * flush location if valid, write otherwise. Tools like pg_receivewal will
 	 * usually (unless in synchronous mode) return an invalid flush location.
 	 */
-	replicatedPtr = XLogRecPtrIsInvalid(MyWalSnd->flush) ?
-		MyWalSnd->write : MyWalSnd->flush;
+	// XXX Zenith uses flush_lsn to pass extra payload, so use write_lsn here
+	replicatedPtr = MyWalSnd->write;
 
 	if (WalSndCaughtUp && sentPtr == replicatedPtr &&
 		!pq_is_send_pending())
@@ -3565,7 +3601,7 @@ WalSndKeepaliveIfNecessary(void)
  * eventually reported to have been written, flushed and applied by the
  * standby in a reply message.
  */
-static void
+void
 LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
 {
 	bool		buffer_full;
@@ -3630,7 +3666,7 @@ LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
  * Return -1 if no new sample data is available, and otherwise the elapsed
  * time in microseconds.
  */
-static TimeOffset
+TimeOffset
 LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now)
 {
 	TimestampTz time = 0;

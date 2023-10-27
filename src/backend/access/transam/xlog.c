@@ -61,6 +61,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -112,6 +113,8 @@ int			CommitSiblings = 5; /* # concurrent xacts needed to sleep */
 int			wal_retrieve_retry_interval = 5000;
 int			max_slot_wal_keep_size_mb = -1;
 bool		track_wal_io_timing = false;
+uint64      predefined_sysidentifier;
+int			lastWrittenLsnCacheSize;
 
 #ifdef WAL_DEBUG
 bool		XLOG_DEBUG = false;
@@ -180,6 +183,26 @@ const struct config_enum_entry recovery_target_action_options[] = {
 	{"shutdown", RECOVERY_TARGET_ACTION_SHUTDOWN, false},
 	{NULL, 0, false}
 };
+
+
+typedef struct LastWrittenLsnCacheEntry
+{
+	BufferTag	key;
+	XLogRecPtr	lsn;
+	/* double linked list for LRU replacement algorithm */
+	dlist_node	lru_node;
+} LastWrittenLsnCacheEntry;
+
+
+/*
+ * Cache of last written LSN for each relation chunk (hash bucket).
+ * Also to provide request LSN for smgrnblocks, smgrexists there is pseudokey=InvalidBlockId which stores LSN of last
+ * relation metadata update.
+ * Size of the cache is limited by GUC variable lastWrittenLsnCacheSize ("lsn_cache_size"),
+ * pages are replaced using LRU algorithm, based on L2-list.
+ * Access to this cache is protected by 'LastWrittenLsnLock'.
+ */
+static HTAB *lastWrittenLsnCache;
 
 /*
  * Statistics for current checkpoint are collected in this global struct.
@@ -280,6 +303,13 @@ bool		InArchiveRecovery = false;
 
 static bool standby_signal_file_found = false;
 static bool recovery_signal_file_found = false;
+
+/*
+ * Variables read from 'zenith.signal' file.
+ */
+bool		ZenithRecoveryRequested = false;
+XLogRecPtr	zenithLastRec = InvalidXLogRecPtr;
+bool		zenithWriteOk = false;
 
 /* Was the last xlog file restored from archive, or local? */
 static bool restoredFromArchive = false;
@@ -742,6 +772,25 @@ typedef struct XLogCtlData
 	 */
 	XLogRecPtr	lastFpwDisableRecPtr;
 
+	/*
+	 * Maximal last written LSN for pages not present in lastWrittenLsnCache
+	 */
+	XLogRecPtr  maxLastWrittenLsn;
+
+	/*
+	 * Double linked list to implement LRU replacement policy for last written LSN cache.
+	 * Access to this list as well as to last written LSN cache is protected by 'LastWrittenLsnLock'.
+	 */
+	dlist_head lastWrittenLsnLRU;
+
+	/* neon: copy of startup's RedoStartLSN for walproposer's use */
+	XLogRecPtr	RedoStartLSN;
+
+	/*
+	 * size of a timeline in zenith pageserver.
+	 * used to enforce timeline size limit.
+	 */
+	uint64 		zenithCurrentClusterSize;
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogCtlData;
 
@@ -754,6 +803,8 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  * We maintain an image of pg_control in shared memory.
  */
 static ControlFileData *ControlFile = NULL;
+
+#define LAST_WRITTEN_LSN_CACHE_BUCKET 1024 /* blocks = 8Mb */
 
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
@@ -963,7 +1014,6 @@ static bool CheckForStandbyTrigger(void);
 static void xlog_outrec(StringInfo buf, XLogReaderState *record);
 #endif
 static void xlog_block_info(StringInfo buf, XLogReaderState *record);
-static void xlog_outdesc(StringInfo buf, XLogReaderState *record);
 static void pg_start_backup_callback(int code, Datum arg);
 static void pg_stop_backup_callback(int code, Datum arg);
 static bool read_backup_label(XLogRecPtr *checkPointLoc,
@@ -5125,11 +5175,8 @@ LocalProcessControlFile(bool reset)
 	ReadControlFile();
 }
 
-/*
- * Initialization of shared memory for XLOG
- */
-Size
-XLOGShmemSize(void)
+static Size
+XLOGCtlShmemSize(void)
 {
 	Size		size;
 
@@ -5169,6 +5216,16 @@ XLOGShmemSize(void)
 	return size;
 }
 
+/*
+ * Initialization of shared memory for XLOG
+ */
+Size
+XLOGShmemSize(void)
+{
+	return XLOGCtlShmemSize() +
+		hash_estimate_size(lastWrittenLsnCacheSize, sizeof(LastWrittenLsnCacheEntry));
+}
+
 void
 XLOGShmemInit(void)
 {
@@ -5196,8 +5253,17 @@ XLOGShmemInit(void)
 
 
 	XLogCtl = (XLogCtlData *)
-		ShmemInitStruct("XLOG Ctl", XLOGShmemSize(), &foundXLog);
+		ShmemInitStruct("XLOG Ctl", XLOGCtlShmemSize(), &foundXLog);
 
+	{
+		static HASHCTL info;
+		info.keysize = sizeof(BufferTag);
+		info.entrysize = sizeof(LastWrittenLsnCacheEntry);
+		lastWrittenLsnCache = ShmemInitHash("last_written_lsn_cache",
+											lastWrittenLsnCacheSize, lastWrittenLsnCacheSize,
+											&info,
+											HASH_ELEM | HASH_BLOBS);
+	}
 	localControlFile = ControlFile;
 	ControlFile = (ControlFileData *)
 		ShmemInitStruct("Control File", sizeof(ControlFileData), &foundCFile);
@@ -5308,10 +5374,16 @@ BootStrapXLOG(void)
 	 * perhaps be useful sometimes.
 	 */
 	gettimeofday(&tv, NULL);
-	sysidentifier = ((uint64) tv.tv_sec) << 32;
-	sysidentifier |= ((uint64) tv.tv_usec) << 12;
-	sysidentifier |= getpid() & 0xFFF;
-
+	if (predefined_sysidentifier != 0)
+	{
+		sysidentifier = predefined_sysidentifier;
+	}
+	else
+	{
+		sysidentifier = ((uint64) tv.tv_sec) << 32;
+		sysidentifier |= ((uint64) tv.tv_usec) << 12;
+		sysidentifier |= getpid() & 0xFFF;
+	}
 	/* First timeline ID is always 1 */
 	ThisTimeLineID = 1;
 
@@ -5546,6 +5618,81 @@ readRecoverySignalFile(void)
 		ereport(FATAL,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("standby mode is not supported by single-user servers")));
+}
+
+static void
+readZenithSignalFile(void)
+{
+	int			fd;
+
+	fd = BasicOpenFile(ZENITH_SIGNAL_FILE, O_RDONLY | PG_BINARY);
+	if (fd >= 0)
+	{
+		struct stat statbuf;
+		char	   *content;
+		char		prev_lsn_str[20];
+
+		/* Slurp the file into a string */
+		if (stat(ZENITH_SIGNAL_FILE, &statbuf) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat file \"%s\": %m",
+							ZENITH_SIGNAL_FILE)));
+		content = palloc(statbuf.st_size + 1);
+		if (read(fd, content, statbuf.st_size) != statbuf.st_size)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							ZENITH_SIGNAL_FILE)));
+		content[statbuf.st_size] = '\0';
+
+		/* Parse it */
+		if (sscanf(content, "PREV LSN: %19s", prev_lsn_str) != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("invalid data in file \"%s\"", ZENITH_SIGNAL_FILE)));
+
+		if (strcmp(prev_lsn_str, "invalid") == 0)
+		{
+			/* No prev LSN. Forbid starting up in read-write mode */
+			zenithLastRec = InvalidXLogRecPtr;
+			zenithWriteOk = false;
+		}
+		else if (strcmp(prev_lsn_str, "none") == 0)
+		{
+			/*
+			 * The page server had no valid prev LSN, but assured that it's ok
+			 * to start without it. This happens when you start the compute
+			 * node for the first time on a new branch.
+			 */
+			zenithLastRec = InvalidXLogRecPtr;
+			zenithWriteOk = true;
+		}
+		else
+		{
+			uint32		hi,
+						lo;
+
+			if (sscanf(prev_lsn_str, "%X/%X", &hi, &lo) != 2)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("invalid data in file \"%s\"", ZENITH_SIGNAL_FILE)));
+			zenithLastRec = ((uint64) hi) << 32 | lo;
+
+			/* If prev LSN is given, it better be valid */
+			if (zenithLastRec == InvalidXLogRecPtr)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("invalid prev-LSN in file \"%s\"", ZENITH_SIGNAL_FILE)));
+			zenithWriteOk = true;
+		}
+		ZenithRecoveryRequested = true;
+		close(fd);
+
+		elog(LOG,
+			 "[ZENITH] found 'zenith.signal' file. setting prev LSN to %X/%X",
+			 LSN_FORMAT_ARGS(zenithLastRec));
+	}
 }
 
 static void
@@ -6529,9 +6676,14 @@ StartupXLOG(void)
 	CurrentResourceOwner = AuxProcessResourceOwner;
 
 	/*
+	 * Read zenith.signal before anything else.
+	 */
+	readZenithSignalFile();
+
+	/*
 	 * Check that contents look valid.
 	 */
-	if (!XRecOffIsValid(ControlFile->checkPoint))
+	if (!XRecOffIsValid(ControlFile->checkPoint) && !ZenithRecoveryRequested)
 		ereport(FATAL,
 				(errmsg("control file contains invalid checkpoint location")));
 
@@ -6661,6 +6813,9 @@ StartupXLOG(void)
 		else if (recoveryTarget == RECOVERY_TARGET_IMMEDIATE)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to earliest consistent point")));
+		else if (ZenithRecoveryRequested)
+			ereport(LOG,
+					(errmsg("starting zenith recovery")));
 		else
 			ereport(LOG,
 					(errmsg("starting archive recovery")));
@@ -6791,6 +6946,31 @@ StartupXLOG(void)
 		/* set flag to delete it later */
 		haveBackupLabel = true;
 	}
+	else if (ZenithRecoveryRequested)
+	{
+		/*
+		 * Zenith hacks to spawn compute node without WAL.  Pretend that we
+		 * just finished reading the record that started at 'zenithLastRec'
+		 * and ended at checkpoint.redo
+		 */
+		elog(LOG, "starting with zenith basebackup at LSN %X/%X, prev %X/%X",
+			 LSN_FORMAT_ARGS(ControlFile->checkPointCopy.redo),
+			 LSN_FORMAT_ARGS(zenithLastRec));
+
+		checkPointLoc = zenithLastRec;
+		RedoStartLSN = ControlFile->checkPointCopy.redo;
+		/* make basebackup LSN available for walproposer */
+		XLogCtl->RedoStartLSN = RedoStartLSN;
+		EndRecPtr = ControlFile->checkPointCopy.redo;
+
+		memcpy(&checkPoint, &ControlFile->checkPointCopy, sizeof(CheckPoint));
+		wasShutdown = true;
+
+		/* Initialize expectedTLEs, like ReadRecord() does */
+		expectedTLEs = readTimeLineHistory(checkPoint.ThisTimeLineID);
+
+		XLogBeginRead(xlogreader, EndRecPtr);
+	}
 	else
 	{
 		/*
@@ -6851,6 +7031,7 @@ StartupXLOG(void)
 		/* Get the last valid checkpoint record. */
 		checkPointLoc = ControlFile->checkPoint;
 		RedoStartLSN = ControlFile->checkPointCopy.redo;
+		XLogCtl->RedoStartLSN = RedoStartLSN;
 		record = ReadCheckpointRecord(xlogreader, checkPointLoc, 1, true);
 		if (record != NULL)
 		{
@@ -7049,7 +7230,7 @@ StartupXLOG(void)
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
 	doPageWrites = lastFullPageWrites;
 
-	if (RecPtr < checkPoint.redo)
+	if (RecPtr < checkPoint.redo && !ZenithRecoveryRequested)
 		ereport(PANIC,
 				(errmsg("invalid redo in checkpoint record")));
 
@@ -7716,9 +7897,54 @@ StartupXLOG(void)
 	 * that and continue after it.  In all other cases, re-fetch the last
 	 * valid or last applied record, so we can identify the exact endpoint of
 	 * what we consider the valid portion of WAL.
+	 *
+	 * When starting from a zenith base backup, we don't have WAL. Initialize
+	 * the WAL page where we will start writing new records from scratch,
+	 * instead.
 	 */
-	XLogBeginRead(xlogreader, LastRec);
-	record = ReadRecord(xlogreader, PANIC, false);
+	if (ZenithRecoveryRequested)
+	{
+		if (!zenithWriteOk)
+		{
+			/*
+			 * We cannot start generating new WAL if we don't have a valid prev-LSN
+			 * to use for the first new WAL record. (Shouldn't happen.)
+			 */
+			ereport(ERROR,
+					(errmsg("cannot start in read-write mode from this base backup")));
+		}
+		else
+		{
+			int			offs = (EndRecPtr % XLOG_BLCKSZ);
+			XLogRecPtr	lastPage = EndRecPtr - offs;
+			int lastPageSize = ((lastPage % wal_segment_size) == 0) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
+			int			idx = XLogRecPtrToBufIdx(lastPage);
+			XLogPageHeader xlogPageHdr = (XLogPageHeader) (XLogCtl->pages + idx * XLOG_BLCKSZ);
+
+			xlogPageHdr->xlp_pageaddr = lastPage;
+			xlogPageHdr->xlp_magic = XLOG_PAGE_MAGIC;
+			xlogPageHdr->xlp_tli = ThisTimeLineID;
+			/*
+			 * If we start writing with offset from page beginning, pretend in
+			 * page header there is a record ending where actual data will
+			 * start.
+			 */
+			xlogPageHdr->xlp_rem_len = offs - lastPageSize;
+			xlogPageHdr->xlp_info = (xlogPageHdr->xlp_rem_len > 0) ? XLP_FIRST_IS_CONTRECORD : 0;
+			readOff = XLogSegmentOffset(lastPage, wal_segment_size);
+
+			elog(LOG, "Continue writing WAL at %X/%X", LSN_FORMAT_ARGS(EndRecPtr));
+
+			// FIXME: should we unlink zenith.signal?
+		}
+	}
+	else
+	{
+		XLogBeginRead(xlogreader, LastRec);
+		record = ReadRecord(xlogreader, PANIC, false);
+		if (!record)
+			elog(PANIC, "could not re-read last record");
+	}
 	EndOfLog = EndRecPtr;
 
 	/*
@@ -7913,7 +8139,8 @@ StartupXLOG(void)
 		/* Copy the valid part of the last block, and zero the rest */
 		page = &XLogCtl->pages[firstIdx * XLOG_BLCKSZ];
 		len = EndOfLog % XLOG_BLCKSZ;
-		memcpy(page, xlogreader->readBuf, len);
+		if (!ZenithRecoveryRequested)
+			memcpy(page, xlogreader->readBuf, len);
 		memset(page + len, 0, XLOG_BLCKSZ - len);
 
 		XLogCtl->xlblocks[firstIdx] = pageBeginPtr + XLOG_BLCKSZ;
@@ -7935,6 +8162,8 @@ StartupXLOG(void)
 
 	XLogCtl->LogwrtRqst.Write = EndOfLog;
 	XLogCtl->LogwrtRqst.Flush = EndOfLog;
+	XLogCtl->maxLastWrittenLsn = EndOfLog;
+	dlist_init(&XLogCtl->lastWrittenLsnLRU);
 
 	LocalSetXLogInsertAllowed();
 
@@ -8704,6 +8933,181 @@ GetInsertRecPtr(void)
 
 	return recptr;
 }
+
+/*
+ * GetLastWrittenLSN -- Returns maximal LSN of written page.
+ * It returns an upper bound for the last written LSN of a given page,
+ * either from a cached last written LSN or a global maximum last written LSN.
+ * If rnode is InvalidOid then we calculate maximum among all cached LSN and maxLastWrittenLsn.
+ * If cache is large enough ,iterting through all hash items may be rather expensive.
+ * But GetLastWrittenLSN(InvalidOid) is used only by zenith_dbsize which is not performance critical.
+ */
+XLogRecPtr
+GetLastWrittenLSN(RelFileNode rnode, ForkNumber forknum, BlockNumber blkno)
+{
+	XLogRecPtr lsn;
+	LastWrittenLsnCacheEntry* entry;
+
+	LWLockAcquire(LastWrittenLsnLock, LW_SHARED);
+
+	/* Maximal last written LSN among all non-cached pages */
+	lsn = XLogCtl->maxLastWrittenLsn;
+
+	if (rnode.relNode != InvalidOid)
+	{
+		BufferTag key;
+		key.rnode = rnode;
+		key.forkNum = forknum;
+		key.blockNum = blkno / LAST_WRITTEN_LSN_CACHE_BUCKET;
+		entry = hash_search(lastWrittenLsnCache, &key, HASH_FIND, NULL);
+		if (entry != NULL)
+			lsn = entry->lsn;
+	}
+	else
+	{
+		HASH_SEQ_STATUS seq;
+		/* Find maximum of all cached LSNs */
+		hash_seq_init(&seq, lastWrittenLsnCache);
+		while ((entry = (LastWrittenLsnCacheEntry *) hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->lsn > lsn)
+				lsn = entry->lsn;
+		}
+	}
+	LWLockRelease(LastWrittenLsnLock);
+
+	return lsn;
+}
+
+/*
+ * SetLastWrittenLSNForBlockRange -- Set maximal LSN of written page range.
+ * We maintain cache of last written LSNs with limited size and LRU replacement
+ * policy. To reduce cache size we store max LSN not for each page, but for
+ * bucket (1024 blocks). This cache allows to use old LSN when
+ * requesting pages of unchanged or appended relations.
+ *
+ * rnode.relNode can be InvalidOid, in this case maxLastWrittenLsn is updated.
+ * SetLastWrittenLsn with dummy rnode is used by createdb and dbase_redo functions.
+ */
+void
+SetLastWrittenLSNForBlockRange(XLogRecPtr lsn, RelFileNode rnode, ForkNumber forknum, BlockNumber from, BlockNumber n_blocks)
+{
+	if (lsn == InvalidXLogRecPtr || n_blocks == 0)
+		return;
+
+	LWLockAcquire(LastWrittenLsnLock, LW_EXCLUSIVE);
+	if (rnode.relNode == InvalidOid)
+	{
+		if (lsn > XLogCtl->maxLastWrittenLsn)
+			XLogCtl->maxLastWrittenLsn = lsn;
+	}
+	else
+	{
+		LastWrittenLsnCacheEntry* entry;
+		BufferTag key;
+		bool found;
+		BlockNumber bucket;
+		BlockNumber start_bucket; /* inclusive */
+		BlockNumber end_bucket;   /* exclusive */
+
+		start_bucket = from / LAST_WRITTEN_LSN_CACHE_BUCKET;
+		end_bucket = from == REL_METADATA_PSEUDO_BLOCKNO
+			? start_bucket + 1 : (from + n_blocks + LAST_WRITTEN_LSN_CACHE_BUCKET - 1) / LAST_WRITTEN_LSN_CACHE_BUCKET;
+
+		key.rnode = rnode;
+		key.forkNum = forknum;
+		for (bucket = start_bucket; bucket < end_bucket; bucket++)
+		{
+			key.blockNum = bucket;
+			entry = hash_search(lastWrittenLsnCache, &key, HASH_ENTER, &found);
+			if (found)
+			{
+				if (lsn > entry->lsn)
+					entry->lsn = lsn;
+				/* Unlink from LRU list */
+				dlist_delete(&entry->lru_node);
+			}
+			else
+			{
+				entry->lsn = lsn;
+				if (hash_get_num_entries(lastWrittenLsnCache) > lastWrittenLsnCacheSize)
+				{
+					/* Replace least recently used entry */
+					LastWrittenLsnCacheEntry* victim = dlist_container(LastWrittenLsnCacheEntry, lru_node, dlist_pop_head_node(&XLogCtl->lastWrittenLsnLRU));
+					/* Adjust max LSN for not cached relations/chunks if needed */
+					if (victim->lsn > XLogCtl->maxLastWrittenLsn)
+						XLogCtl->maxLastWrittenLsn = victim->lsn;
+
+					hash_search(lastWrittenLsnCache, victim, HASH_REMOVE, NULL);
+				}
+			}
+			/* Link to the end of LRU list */
+			dlist_push_tail(&XLogCtl->lastWrittenLsnLRU, &entry->lru_node);
+		}
+	}
+	LWLockRelease(LastWrittenLsnLock);
+}
+
+/*
+ * SetLastWrittenLSNForBlock -- Set maximal LSN for block
+ */
+void
+SetLastWrittenLSNForBlock(XLogRecPtr lsn, RelFileNode rnode, ForkNumber forknum, BlockNumber blkno)
+{
+	SetLastWrittenLSNForBlockRange(lsn, rnode, forknum, blkno, 1);
+}
+
+/*
+ * SetLastWrittenLSNForRelation -- Set maximal LSN for relation metadata
+ */
+void
+SetLastWrittenLSNForRelation(XLogRecPtr lsn, RelFileNode rnode, ForkNumber forknum)
+{
+	SetLastWrittenLSNForBlock(lsn, rnode, forknum, REL_METADATA_PSEUDO_BLOCKNO);
+}
+
+/*
+ * SetLastWrittenLSNForDatabase -- Set maximal LSN for the whole database
+ */
+void
+SetLastWrittenLSNForDatabase(XLogRecPtr lsn)
+{
+	RelFileNode dummyNode = {InvalidOid, InvalidOid, InvalidOid};
+	SetLastWrittenLSNForBlock(lsn, dummyNode, MAIN_FORKNUM, 0);
+}
+
+/*
+ * RedoStartLsn is set only once by startup process, locking is not required
+ * after its exit.
+ */
+XLogRecPtr
+GetRedoStartLsn(void)
+{
+	return XLogCtl->RedoStartLSN;
+}
+
+
+uint64
+GetZenithCurrentClusterSize(void)
+{
+	uint64 size;
+	SpinLockAcquire(&XLogCtl->info_lck);
+	size = XLogCtl->zenithCurrentClusterSize;
+	SpinLockRelease(&XLogCtl->info_lck);
+
+	return size;
+}
+
+
+void
+SetZenithCurrentClusterSize(uint64 size)
+{
+	SpinLockAcquire(&XLogCtl->info_lck);
+	XLogCtl->zenithCurrentClusterSize = size;
+	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+
 
 /*
  * GetFlushRecPtr -- Returns the current flush position, ie, the last WAL
@@ -10566,10 +10970,20 @@ xlog_redo(XLogReaderState *record)
 		for (uint8 block_id = 0; block_id <= record->max_block_id; block_id++)
 		{
 			Buffer		buffer;
+			XLogRedoAction result;
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
+			result = XLogReadBufferForRedo(record, block_id, &buffer);
+			if (result == BLK_DONE && !IsUnderPostmaster)
+			{
+				/*
+				 * In the special WAL process, blocks that are being ignored
+				 * return BLK_DONE. Accept that.
+				 */
+			}
+			else if (result != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
-			UnlockReleaseBuffer(buffer);
+			if (buffer != InvalidBuffer)
+				UnlockReleaseBuffer(buffer);
 		}
 	}
 	else if (info == XLOG_BACKUP_END)
@@ -10752,7 +11166,7 @@ xlog_block_info(StringInfo buf, XLogReaderState *record)
  * Returns a string describing an XLogRecord, consisting of its identity
  * optionally followed by a colon, a space, and a further description.
  */
-static void
+void
 xlog_outdesc(StringInfo buf, XLogReaderState *record)
 {
 	RmgrId		rmid = XLogRecGetRmid(record);

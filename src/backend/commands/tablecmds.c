@@ -14173,7 +14173,7 @@ index_copy_data(Relation rel, RelFileNode newrnode)
 {
 	SMgrRelation dstrel;
 
-	dstrel = smgropen(newrnode, rel->rd_backend);
+	dstrel = smgropen(newrnode, rel->rd_backend, rel->rd_rel->relpersistence);
 	RelationOpenSmgr(rel);
 
 	/*

@@ -87,6 +87,7 @@
 #include "storage/pg_shmem.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
+#include "storage/smgr.h"
 #include "storage/standby.h"
 #include "tcop/tcopprot.h"
 #include "tsearch/ts_cache.h"
@@ -954,6 +955,17 @@ static const unit_conversion time_unit_conversion_table[] =
 
 static struct config_bool ConfigureNamesBool[] =
 {
+	{
+		{"enable_seqscan_prefetch", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the sequence scan next page prefetching."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_seqscan_prefetch,
+		false, /* temporary disable to be able to merge in main */
+		/* true, */
+		NULL, NULL, NULL
+	},
 	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
@@ -2123,6 +2135,16 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"neon_test_evict", PGC_POSTMASTER, UNGROUPED,
+			gettext_noop("Evict unpinned pages (for better test coverage)"),
+		},
+		&zenith_test_evict,
+		false,
+		NULL, NULL, NULL
+	},
+
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
@@ -2132,6 +2154,17 @@ static struct config_bool ConfigureNamesBool[] =
 
 static struct config_int ConfigureNamesInt[] =
 {
+	{
+		{"seqscan_prefetch_buffers", PGC_USERSET, QUERY_TUNING_METHOD,
+		 gettext_noop("Number of subsequent buffer to be prefetched during sequential scan."),
+		 NULL,
+		 GUC_EXPLAIN
+		},
+		&seqscan_prefetch_buffers,
+		/* 8, 0, 1000, */
+		0, 0, 1000, /* temporary disable to be able to merge in main */
+		NULL, NULL, NULL
+	},
 	{
 		{"archive_timeout", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Forces a switch to the next WAL file if a "
@@ -2341,6 +2374,16 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&NBuffers,
 		1024, 16, INT_MAX / 2,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"lsn_cache_size", PGC_POSTMASTER, UNGROUPED,
+			gettext_noop("Size of las written LSN cache used by Neon."),
+			NULL
+		},
+		&lastWrittenLsnCacheSize,
+		1024, 10, 1000000, /* 1024 is enough to hold 10GB database with 8Mb bucket */
 		NULL, NULL, NULL
 	},
 
@@ -2885,6 +2928,42 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&max_replication_slots,
 		10, 0, MAX_BACKENDS /* XXX? */ ,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_replication_apply_lag", PGC_POSTMASTER, REPLICATION_SENDING,
+			gettext_noop("Maximal write lag between master and replicas."),
+			gettext_noop("When lag between minimal apply position of replica and current LSN exceeds this value,"
+						 "backends are blocked."),
+			GUC_UNIT_MB,
+		},
+		&max_replication_apply_lag,
+		-1, -1, INT_MAX, /* it should not be smaller than maximal size of WAL record */
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_replication_flush_lag", PGC_POSTMASTER, REPLICATION_SENDING,
+			gettext_noop("Maximal flush lag between master and replicas."),
+			gettext_noop("When lag between minimal flush position of replica and current LSN exceeds this value,"
+						 "backends are blocked"),
+			GUC_UNIT_MB,
+		},
+		&max_replication_flush_lag,
+		-1, -1, INT_MAX, /* it should not be smaller than maximal size of WAL record */
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_replication_write_lag", PGC_POSTMASTER, REPLICATION_SENDING,
+			gettext_noop("Maximal write lag between master and replicas."),
+			gettext_noop("When lag between minimal write position of replica and current LSN exceeds this value,"
+						 "backends are blocked"),
+			GUC_UNIT_MB,
+		},
+		&max_replication_write_lag,
+		-1, -1, INT_MAX, /* it should not be smaller than maximal size of WAL record */
 		NULL, NULL, NULL
 	},
 
